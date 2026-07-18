@@ -14,29 +14,26 @@ from urllib.request import urlopen, Request
 
 # ========== 交易记录（用户持仓） ==========
 TRANSACTIONS = [
-    {"code": "022831", "name": "华商电子C", "type": "买入", "amount": 3000, "date": "2026-07-15", "note": "首次买入"},
-    {"code": "022831", "name": "华商电子C", "type": "清仓转出", "amount": 0, "date": "2026-07-17", "shares": 726.62, "note": "亏损约160元，转至嘉实农业C，周一确认份额"},
     {"code": "021753", "name": "南方电力C", "type": "买入", "amount": 2000, "date": "2026-07-16"},
     {"code": "014064", "name": "银华农业C", "type": "买入", "amount": 5000, "date": "2026-07-16"},
-    {"code": "012087", "name": "博时健康C", "type": "买入", "amount": 3000, "date": "2026-07-16"},
     {"code": "017938", "name": "易方达医疗C", "type": "买入", "amount": 2000, "date": "2026-07-15"},
-    {"code": "027034", "name": "中银AI C", "type": "买入", "amount": 3000, "date": "2026-07-15"},
-    {"code": "015468", "name": "嘉实农业C", "type": "转入", "amount": 0, "date": "2026-07-17", "shares": 726.62, "note": "从华商电子C转入，周一确认份额"},
+    {"code": "015468", "name": "嘉实农业C", "type": "转入", "amount": 0, "date": "2026-07-17", "shares": 726.62, "note": "从华商电子C转入"},
+    {"code": "014064", "name": "银华农业C", "type": "转出", "amount": 0, "date": "2026-07-18", "note": "部分转至南方电力C"},
+    {"code": "017938", "name": "易方达医疗C", "type": "转出", "amount": 0, "date": "2026-07-18", "note": "部分转至南方电力C"},
+    {"code": "022831", "name": "华商电子C", "type": "清仓", "amount": 0, "date": "2026-07-18", "note": "全部转至嘉实农业C"},
+    {"code": "012087", "name": "博时健康C", "type": "清仓", "amount": 0, "date": "2026-07-18", "note": "卖出"},
+    {"code": "027034", "name": "中银AI C", "type": "清仓", "amount": 0, "date": "2026-07-18", "note": "卖出"},
 ]
 
 # ========== 配置 ==========
 FUNDS = [
-    {"code": "022831", "name": "华商电子C", "sector": "tech", "short": "电子"},
     {"code": "021753", "name": "南方电力C", "sector": "power", "short": "电力"},
     {"code": "014064", "name": "银华农业C", "sector": "agri", "short": "农业"},
-    {"code": "012087", "name": "博时健康C", "sector": "med", "short": "健康"},
     {"code": "017938", "name": "易方达医疗C", "sector": "med", "short": "医疗"},
-    {"code": "027034", "name": "中银AI C", "sector": "tech", "short": "AI"},
     {"code": "015468", "name": "嘉实农业C", "sector": "agri", "short": "农业2"},
 ]
 
 SECTORS = {
-    "tech":  {"name": "科技", "index": "sh000032"},
     "power": {"name": "电力", "index": "sz399808"},
     "agri":  {"name": "农业", "index": "sh000949"},
     "med":   {"name": "医药", "index": "sz399989"},
@@ -44,9 +41,8 @@ SECTORS = {
 MARKET_INDICES = {"上证指数": "sh000001", "创业板指": "sz399006"}
 
 BEST_PARAMS = {
-    "022831": (20, 0.01), "021753": (20, 0.01), "014064": (26, 0.01),
-    "012087": (26, 0.01), "017938": (30, 0.01), "027034": (36, 0.10),
-    "015468": (30, 1.00),
+    "021753": (20, 0.01), "014064": (26, 0.01),
+    "017938": (30, 0.01), "015468": (30, 1.00),
 }
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
