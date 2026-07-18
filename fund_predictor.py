@@ -55,7 +55,7 @@ PREDICTIONS_FILE = os.path.join(SCRIPT_DIR, "fund_predictions.json")
 # 本地运行时输出到桌面，PythonAnywhere运行时输出到网站目录，GitHub Actions输出到output/
 _DESKTOP = os.path.expanduser("~/Desktop/基金预测.html")
 _WEBSITE = os.path.expanduser("~/mysite/基金预测.html")
-_GITHUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "基金预测.html")
+_GITHUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "index.html")
 # 优先级：output/ > mysite/ > Desktop
 if os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")):
     OUTPUT_FILE = _GITHUB
