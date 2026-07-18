@@ -23,6 +23,7 @@ jobs:
 
       - name: Run fund predictor
         run: |
+          mkdir -p output
           python fund_predictor.py
 
       - name: Deploy to GitHub Pages
