@@ -1,0 +1,41 @@
+# PythonAnywhere 部署步骤
+
+## 第一步：注册
+1. 打开 https://www.pythonanywhere.com
+2. 点击 "Create a Beginner account"（免费）
+3. 填写用户名、邮箱、密码
+4. 记住你的用户名（后面要用）
+
+## 第二步：上传文件
+1. 登录后点击顶部 "Files"
+2. 进入目录：fund_predictor_cloud/
+3. 上传这两个文件：
+   - fund_predictor.py
+   - chart.min.js
+4. 同时上传到：mysite/ 目录（chart.min.js需要在这里）
+
+## 第三步：测试运行
+1. 点击顶部 "Consoles" → "Bash"
+2. 输入：python fund_predictor_cloud/fund_predictor.py
+3. 等待运行完成（约2-3分钟）
+4. 看到 "✅ ...基金预测.html" 就成功了
+
+## 第四步：设置网站
+1. 点击顶部 "Web"
+2. 点击 "Add a new web app"
+3. 选择 "Manual configuration" → "Python 3.10"
+4. 设置 Source code: /home/你的用户名/fund_predictor_cloud
+5. 编辑 WSGI configuration file：
+   把内容替换成 flask_app.py 的内容
+6. 点击 "Reload" 按钮
+
+## 第五步：设置定时任务
+1. 点击顶部 "Tasks"
+2. 添加定时任务：
+   - 时间：Daily（每天）
+   - 命令：python /home/你的用户名/fund_predictor_cloud/fund_predictor.py
+3. 保存
+
+## 完成！
+访问：https://你的用户名.pythonanywhere.com
+手机浏览器也能打开！

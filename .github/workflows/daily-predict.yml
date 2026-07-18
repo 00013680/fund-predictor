@@ -1,0 +1,34 @@
+name: Daily Fund Prediction
+
+on:
+  schedule:
+    # 每天北京时间 9:30 (UTC 1:30)
+    - cron: '30 1 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+permissions:
+  contents: write
+  pages: write
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run fund predictor
+        run: |
+          python fund_predictor.py
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./output
+          force_orphan: true
