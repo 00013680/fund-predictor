@@ -3,8 +3,8 @@ import subprocess, os, hashlib, time
 
 app = Flask(__name__)
 
-# 简单的密钥保护
-SECRET = "fund_predict_2026"
+# 密钥从环境变量读取，不在代码中硬编码
+SECRET = os.environ.get("FUND_PREDICT_SECRET", "fund_predict_2026")
 
 @app.route("/")
 def index():

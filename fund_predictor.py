@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-基金预测 v4 — 日级别交易指导
+基金预测 v6 — 日级别在线学习（3日平滑目标）
 功能：
-1. 三层量化模型预测
-2. 日级别交易策略（加仓/减持/持有/观望）
-3. 预测跟踪记录
-4. 精美HTML仪表盘
+1. 三层量化模型预测（日级别）
+2. 在线学习：每有新净值数据，微调个体模型（3步SGD）
+3. 技术指标特征（RSI, MACD, 均线乖离等）
+4. 日级别交易策略（买入/持有/减持/观望）
+5. 模型权重持久化（跨运行保留）
+6. 精美HTML仪表盘
 """
 
 import json, math, os, sys, time
@@ -52,13 +54,12 @@ BEST_PARAMS = {
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PREDICTIONS_FILE = os.path.join(SCRIPT_DIR, "fund_predictions.json")
+MODEL_DIR = os.path.join(SCRIPT_DIR, "model_weights")
 # ===== 部署配置 =====
-# 本地运行时输出到桌面，PythonAnywhere运行时输出到网站目录，GitHub Actions输出到output/
 _DESKTOP = os.path.expanduser("~/Desktop/基金预测.html")
 _WEBSITE = os.path.expanduser("~/mysite/基金预测.html")
-_GITHUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "index.html")
-# 优先级：output/ > mysite/ > Desktop
-if os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")):
+_GITHUB = os.path.join(SCRIPT_DIR, "output", "index.html")
+if os.path.isdir(os.path.join(SCRIPT_DIR, "output")):
     OUTPUT_FILE = _GITHUB
 elif os.path.isdir(os.path.expanduser("~/mysite")):
     OUTPUT_FILE = _WEBSITE
@@ -100,73 +101,249 @@ def fetch_sina_kline(symbol, days=999):
         req = Request(url, headers=headers)
         with urlopen(req, timeout=15) as resp:
             text = resp.read().decode("utf-8")
-        return [{"date": item["day"], "close": float(item["close"])} for item in json.loads(text)]
+        return [{"date": item["day"], "close": float(item["close"]), "volume": float(item.get("volume", 0))} for item in json.loads(text)]
     except: return []
 
-def daily_to_weekly(data, key="nav"):
-    if not data: return []
-    weekly, cur_week, prev = [], None, None
-    for item in data:
-        d = datetime.strptime(item["date"], "%Y-%m-%d")
-        w = d.isocalendar()[:2]
-        if w != cur_week:
-            if cur_week is not None and prev: weekly.append(prev)
-            cur_week = w
-        prev = item
-    if prev: weekly.append(prev)
-    return weekly
+def calc_returns(data, key="nav"):
+    """从净值/价格序列计算收益率"""
+    return [{"date": data[i]["date"], "return": (data[i][key]-data[i-1][key])/data[i-1][key], "value": data[i][key]}
+            for i in range(1, len(data)) if data[i-1][key] > 0]
 
-def calc_returns(weekly, key="nav"):
-    return [{"date": weekly[i]["date"], "return": (weekly[i][key]-weekly[i-1][key])/weekly[i-1][key], "value": weekly[i][key]}
-            for i in range(1, len(weekly)) if weekly[i-1][key] > 0]
-
-# ========== 特征工程 ==========
-def build_features(fund_w, sector_w, market_w_list, lookback=4):
-    features, targets = [], []
-    fund_rets = [w["return"] for w in fund_w]
-    for i in range(lookback, len(fund_w)):
-        feat = {}
-        for w in [1, 2, 3, 4]:
-            feat[f"fund_ret_{w}w"] = sum(fund_rets[i-j] for j in range(w)) if i >= w else 0
-        if i >= 4:
-            r4 = fund_rets[i-3:i+1]; m4 = sum(r4)/4
-            feat["fund_vol_4w"] = math.sqrt(sum((r-m4)**2 for r in r4)/4)
-        else: feat["fund_vol_4w"] = 0
-        feat["fund_accel"] = fund_rets[i] - fund_rets[i-1] if i >= 1 else 0
-        if sector_w and i < len(sector_w):
-            s_rets = [w["return"] for w in sector_w]
-            for w in [1, 2, 4]:
-                feat[f"sector_ret_{w}w"] = sum(s_rets[i-j] for j in range(w)) if i >= w and i < len(s_rets) else 0
+# ========== 技术指标 ==========
+def calc_sma(prices, period):
+    """简单移动平均"""
+    sma = []
+    for i in range(len(prices)):
+        if i < period - 1:
+            sma.append(None)
         else:
-            for w in [1, 2, 4]: feat[f"sector_ret_{w}w"] = 0
+            sma.append(sum(prices[i-period+1:i+1]) / period)
+    return sma
+
+def calc_ema(values, period):
+    """指数移动平均"""
+    if not values: return []
+    multiplier = 2 / (period + 1)
+    ema = [values[0]]
+    for v in values[1:]:
+        ema.append((v - ema[-1]) * multiplier + ema[-1])
+    return ema
+
+def calc_rsi(returns, period=14):
+    """相对强弱指标 RSI"""
+    gains = [max(r, 0) for r in returns]
+    losses = [max(-r, 0) for r in returns]
+    rsi = [None] * period
+    if len(returns) <= period: return rsi
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(returns)):
+        avg_gain = (avg_gain * (period-1) + gains[i]) / period
+        avg_loss = (avg_loss * (period-1) + losses[i]) / period
+        if avg_loss == 0:
+            rsi.append(100)
+        else:
+            rs = avg_gain / avg_loss
+            rsi.append(100 - 100 / (1 + rs))
+    return rsi
+
+def calc_macd(returns, fast=12, slow=26, signal=9):
+    """MACD 指标"""
+    prices = [100.0]
+    for r in returns:
+        prices.append(prices[-1] * (1 + r))
+    ema_fast = calc_ema(prices, fast)
+    ema_slow = calc_ema(prices, slow)
+    macd_line = [ema_fast[i] - ema_slow[i] for i in range(len(prices))]
+    signal_line = calc_ema(macd_line, signal)
+    return macd_line, signal_line
+
+# ========== 日级别特征工程 ==========
+def build_features_daily(daily_returns, sector_returns, market_returns_list,
+                         sector_vol_by_date=None, market_vol_by_date=None, lookback=5):
+    """
+    生成日级别特征：
+      - 基础：滞后收益 + 波动率 + 加速度
+      - 技术：RSI + MACD + 均线乖离
+      - 量能：板块/大盘成交量比 + 量价趋势
+      - 日历：星期效应 + 月初月末 + 季末
+    """
+    fund_rets = [r["return"] for r in daily_returns]
+    n = len(fund_rets)
+    if n < lookback + 1:
+        return [], []
+
+    # 技术指标
+    rsi_values = calc_rsi(fund_rets, 14)
+    macd_line, macd_signal = calc_macd(fund_rets, 12, 26, 9)
+    prices = [100.0]
+    for r in fund_rets:
+        prices.append(prices[-1] * (1 + r))
+    prices = prices[1:]  # 对齐长度
+    ma5 = calc_sma(prices, 5)
+    ma20 = calc_sma(prices, 20)
+
+    features, targets = [], []
+    for i in range(lookback, n):
+        feat = {}
+
+        # ——— 基础特征：滞后收益 ———
+        for w in [1, 2, 3, 5]:
+            feat[f"fund_ret_{w}d"] = sum(fund_rets[i-j] for j in range(w)) if i >= w else 0
+
+        # ——— 波动率 ———
+        for vol_days in [5, 10]:
+            if i >= vol_days:
+                rv = fund_rets[i-vol_days+1:i+1]
+                mv = sum(rv) / vol_days
+                feat[f"fund_vol_{vol_days}d"] = math.sqrt(sum((r-mv)**2 for r in rv) / vol_days)
+            else:
+                feat[f"fund_vol_{vol_days}d"] = 0
+
+        # ——— 加速度 ———
+        feat["fund_accel"] = fund_rets[i] - fund_rets[i-1] if i >= 1 else 0
+
+        # ——— RSI / MACD / 均线乖离 ———
+        feat["fund_rsi_14"] = rsi_values[i] if i < len(rsi_values) and rsi_values[i] is not None else 50
+        if i < len(macd_line) and i < len(macd_signal):
+            feat["fund_macd"] = macd_line[i]
+            feat["fund_macd_signal"] = macd_signal[i]
+        else:
+            feat["fund_macd"] = feat["fund_macd_signal"] = 0
+        feat["fund_ma5_div"] = (prices[i] / ma5[i] - 1) * 100 if i < len(ma5) and ma5[i] else 0
+        feat["fund_ma20_div"] = (prices[i] / ma20[i] - 1) * 100 if i < len(ma20) and ma20[i] else 0
+
+        # ——— 板块收益率 ———
+        if sector_returns and i < len(sector_returns):
+            s_rets = [r["return"] for r in sector_returns]
+            for w in [1, 5]:
+                feat[f"sector_ret_{w}d"] = sum(s_rets[i-j] for j in range(w)) if i >= w and i < len(s_rets) else 0
+        else:
+            for w in [1, 5]: feat[f"sector_ret_{w}d"] = 0
+
+        # ——— 大盘收益率 ———
         m_avg = []
-        for mw in market_w_list:
-            if mw and i < len(mw): m_avg.append(mw[i]["return"])
-        feat["market_ret_1w"] = sum(m_avg)/len(m_avg) if m_avg else 0
-        for w in [2, 4]:
+        for mw in market_returns_list:
+            if mw and i < len(mw):
+                m_avg.append(mw[i]["return"])
+        feat["market_ret_1d"] = sum(m_avg) / len(m_avg) if m_avg else 0
+        for w in [2, 5]:
             mv = []
-            for mw in market_w_list:
-                if mw and i >= w and i < len(mw): mv.append(sum(mw[i-j]["return"] for j in range(w)))
-            feat[f"market_ret_{w}w"] = sum(mv)/len(mv) if mv else 0
-        feat["sector_market_spread"] = feat["sector_ret_1w"] - feat["market_ret_1w"]
-        feat["fund_sector_spread"] = fund_rets[i] - feat["sector_ret_1w"]
+            for mw in market_returns_list:
+                if mw and i >= w and i < len(mw):
+                    mv.append(sum(mw[i-j]["return"] for j in range(w)))
+            feat[f"market_ret_{w}d"] = sum(mv) / len(mv) if mv else 0
+
+        # ——— 价差 ———
+        feat["sector_market_spread"] = feat.get("sector_ret_1d", 0) - feat["market_ret_1d"]
+        feat["fund_sector_spread"] = fund_rets[i] - feat.get("sector_ret_1d", 0)
+
+        # ——— ✨ 量能指标（板块/大盘成交量） ———
+        current_date = daily_returns[i]["date"]
+
+        if sector_vol_by_date:
+            sv = sector_vol_by_date.get(current_date, 0)
+            sv_list = []
+            for k in range(max(0, i-20), i+1):
+                d = daily_returns[k]["date"]
+                sv_list.append(sector_vol_by_date.get(d, 0))
+            avg_sv = sum(sv_list) / len(sv_list) if sv_list else 1
+            feat["sector_vol_ratio"] = sv / avg_sv if avg_sv > 0 else 1.0
+
+            # 近5天板块成交量放大天数占比
+            sv_up = 0
+            for k in range(max(0, i-4), i+1):
+                d_cur = daily_returns[k]["date"]
+                d_prev = daily_returns[max(0, k-1)]["date"]
+                v_cur = sector_vol_by_date.get(d_cur, 0)
+                v_prev = sector_vol_by_date.get(d_prev, 0)
+                if v_cur > v_prev and v_prev > 0:
+                    sv_up += 1
+            feat["sector_vol_trend"] = sv_up / 5.0
+        else:
+            feat["sector_vol_ratio"] = 1.0
+            feat["sector_vol_trend"] = 0.5
+
+        if market_vol_by_date:
+            mv = market_vol_by_date.get(current_date, 0)
+            mv_list = []
+            for k in range(max(0, i-20), i+1):
+                d = daily_returns[k]["date"]
+                mv_list.append(market_vol_by_date.get(d, 0))
+            avg_mv = sum(mv_list) / len(mv_list) if mv_list else 1
+            feat["market_vol_ratio"] = mv / avg_mv if avg_mv > 0 else 1.0
+        else:
+            feat["market_vol_ratio"] = 1.0
+
+        # ——— ✨ 日历效应 ———
+        dt = datetime.strptime(current_date, "%Y-%m-%d")
+        wd = dt.weekday()
+        for d_idx, d_name in enumerate(["mon", "tue", "wed", "thu"]):
+            feat[f"is_{d_name}"] = 1.0 if wd == d_idx else 0.0
+        # Friday = 全0基线
+
+        dom = dt.day
+        feat["month_start"] = 1.0 if dom <= 3 else 0.0
+        feat["month_end"] = 1.0 if dom >= 28 else 0.0
+        feat["is_quarter_end"] = 1.0 if dt.month in [3, 6, 9, 12] and dom >= 25 else 0.0
+
+        # ——— ✨✨ 多项式特征扩展（交互项 + 平方） ———
+        feat["poly_rsi_sq"] = feat["fund_rsi_14"] ** 2
+        feat["poly_vol_sq"] = feat["fund_vol_5d"] ** 2
+        feat["poly_ret1_ret5"] = feat["fund_ret_1d"] * feat["fund_ret_5d"]
+        feat["poly_rsi_vol"] = feat["fund_rsi_14"] * feat["fund_vol_5d"]
+        feat["poly_ma5_ma20"] = feat["fund_ma5_div"] * feat["fund_ma20_div"]
+        feat["poly_sector_fund"] = feat.get("sector_ret_1d", 0) * feat["fund_ret_1d"]
+        feat["poly_market_sector"] = feat["market_ret_1d"] * feat.get("sector_ret_1d", 0)
+        feat["poly_vol_ret"] = feat.get("sector_vol_ratio", 1) * feat.get("sector_ret_1d", 0)
+
         features.append(feat)
-        if i + 1 < len(fund_w): targets.append({"return": fund_w[i+1]["return"], "date": fund_w[i+1]["date"]})
-        else: targets.append(None)
+
+        # ——— 目标：3日平均收益率（平滑噪声，提高信噪比） ———
+        if i + 1 < n:
+            if i + 3 < n:
+                target_val = sum(fund_rets[i+1:i+4]) / 3.0
+            else:
+                target_val = fund_rets[i+1]  # 最后2条fallback到1日
+            targets.append({"return": target_val, "date": daily_returns[i+1]["date"]})
+        else:
+            targets.append(None)
+
     return features, targets
 
-# ========== 模型 ==========
+# ========== 模型（v3：标准化 + 学习率衰减 + 在线学习） ==========
 class RidgeModel:
-    def __init__(self, alpha=0.1, lr=0.01, n_epochs=200):
+    def __init__(self, alpha=0.1, lr=0.01, n_epochs=500):
         self.alpha = alpha; self.lr = lr; self.n_epochs = n_epochs
         self.weights = None; self.bias = 0; self.feature_names = None; self.trained = False
+        self.feat_mean = {}; self.feat_std = {}
+
+    def _standardize(self, row):
+        out = {}
+        for f in self.feature_names:
+            v = row.get(f, 0)
+            m = self.feat_mean.get(f, 0)
+            s = self.feat_std.get(f, 1)
+            out[f] = (v - m) / s if s > 1e-10 else 0
+        return out
+
     def fit(self, X, y):
         if not X or len(X) < 5: return
         self.feature_names = sorted(X[0].keys())
         n, d = len(X), len(self.feature_names)
-        Xm = [[x.get(f, 0) for f in self.feature_names] for x in X]
+        X_raw = [[x.get(f, 0) for f in self.feature_names] for x in X]
+        for j, f in enumerate(self.feature_names):
+            vals = [X_raw[i][j] for i in range(n)]
+            self.feat_mean[f] = sum(vals) / n
+            var = sum((v - self.feat_mean[f])**2 for v in vals) / n
+            self.feat_std[f] = math.sqrt(var) if var > 1e-10 else 1
+        Xm = X_raw
+        for i in range(n):
+            for j, f in enumerate(self.feature_names):
+                Xm[i][j] = (Xm[i][j] - self.feat_mean[f]) / self.feat_std[f]
         self.weights = [0.0] * d; self.bias = sum(y) / n
-        for _ in range(self.n_epochs):
+        for ep in range(self.n_epochs):
+            lr_adj = self.lr / (1 + ep / 100)
             gw = [0.0] * d; gb = 0.0
             for i in range(n):
                 pred = self.bias + sum(self.weights[j] * Xm[i][j] for j in range(d))
@@ -175,161 +352,227 @@ class RidgeModel:
                 gb += 2 * err / n
             for j in range(d):
                 gw[j] += 2 * self.alpha * self.weights[j] / n
-                self.weights[j] -= self.lr * gw[j]
-            self.bias -= self.lr * gb
+                self.weights[j] -= lr_adj * gw[j]
+            self.bias -= lr_adj * gb
         self.trained = True
+
+    def partial_fit(self, X, y, n_epochs=3):
+        """在线更新：用新数据做少量梯度下降步，保留原有标准化参数"""
+        if not self.trained or not X or len(X) < 1:
+            return self.fit(X, y)
+        n = len(X)
+        d = len(self.weights)
+        # 用已有统计量标准化新数据
+        Xm = [[x.get(f, 0) for f in self.feature_names] for x in X]
+        for i in range(n):
+            for j, f in enumerate(self.feature_names):
+                s = self.feat_std.get(f, 1)
+                Xm[i][j] = (Xm[i][j] - self.feat_mean.get(f, 0)) / s if s > 1e-10 else 0
+        for ep in range(n_epochs):
+            lr_adj = self.lr / (1 + ep)
+            gw = [0.0] * d; gb = 0.0
+            for i in range(n):
+                pred = self.bias + sum(self.weights[j] * Xm[i][j] for j in range(d))
+                err = pred - y[i]
+                for j in range(d): gw[j] += 2 * err * Xm[i][j] / n
+                gb += 2 * err / n
+            for j in range(d):
+                gw[j] += self.alpha * self.weights[j]
+                self.weights[j] -= lr_adj * gw[j]
+            self.bias -= lr_adj * gb
+
     def predict(self, x):
         if not self.trained: return 0
-        return self.bias + sum(self.weights[j] * x.get(f, 0) for j, f in enumerate(self.feature_names))
+        xn = self._standardize(x)
+        return self.bias + sum(self.weights[j] * xn.get(f, 0) for j, f in enumerate(self.feature_names))
 
-# ========== 三层预测 ==========
-def predict_fund(all_fund_data, fund_code, sector):
+# ========== 模型持久化 ==========
+def save_model_state(model, path, last_date=""):
+    """保存模型权重到JSON"""
+    state = {
+        "version": 5, "last_date": last_date,
+        "alpha": model.alpha, "lr": model.lr, "n_epochs": model.n_epochs,
+        "weights": model.weights, "bias": model.bias,
+        "feature_names": model.feature_names,
+        "feat_mean": model.feat_mean, "feat_std": model.feat_std,
+        "trained": model.trained,
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def load_model_state(model, path):
+    """从JSON加载模型权重，返回最后训练日期"""
+    try:
+        with open(path, "r") as f:
+            state = json.load(f)
+        if state.get("version") != 5: return None
+        model.alpha = state["alpha"]
+        model.lr = state["lr"]
+        model.n_epochs = state["n_epochs"]
+        model.weights = state["weights"]
+        model.bias = state["bias"]
+        model.feature_names = state["feature_names"]
+        model.feat_mean = state["feat_mean"]
+        model.feat_std = state["feat_std"]
+        model.trained = state["trained"]
+        return state.get("last_date", "")
+    except:
+        return None
+
+# ========== 日级别在线预测（三层集成） ==========
+def predict_daily(all_fund_data, fund_code, sector, model_dir):
+    """三层预测 + 个体模型在线校准"""
     params = BEST_PARAMS.get(fund_code, (36, 0.1))
-    train_window, alpha = params
+    alpha = params[1]
     fund_feats = all_fund_data[fund_code]["features"]
     fund_tgts = all_fund_data[fund_code]["targets"]
     n = len(fund_feats)
     if n < 10: return 0, 0, 0, 0
     last_feat = fund_feats[-1]
-    train_start = max(0, n - train_window)
 
+    # ── 个体模型（在线学习） ──
+    indiv_path = os.path.join(model_dir, f"{fund_code}_indiv.json")
+    indiv = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=3)
+    last_date = load_model_state(indiv, indiv_path)
+
+    if not last_date or not indiv.trained:
+        # 首次运行：全量训练
+        ix, iy = [], []
+        for j in range(n - 1):
+            if fund_tgts[j] is not None:
+                ix.append(fund_feats[j]); iy.append(fund_tgts[j]["return"])
+        if len(ix) >= 20:
+            indiv = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=500)
+            indiv.fit(ix, iy)
+            new_last_date = fund_tgts[n-2]["date"] if n >= 2 else ""
+        else:
+            indiv = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=200)
+            if len(ix) >= 5:
+                indiv.fit(ix, iy)
+            new_last_date = ""
+    else:
+        # 在线更新：找上次训练后的新数据
+        new_X, new_y = [], []
+        for j in range(n - 1):
+            if fund_tgts[j] is not None and fund_tgts[j]["date"] > last_date:
+                new_X.append(fund_feats[j]); new_y.append(fund_tgts[j]["return"])
+        if new_X:
+            indiv.partial_fit(new_X, new_y, n_epochs=3)
+            print(f"    {fund_code} 在线学习: +{len(new_X)}条 [{new_X[0]['date']} → {new_X[-1]['date']}]")
+        new_last_date = fund_tgts[n-2]["date"] if n >= 2 else ""
+        if not new_last_date:
+            new_last_date = last_date
+
+    # 保存更新后的模型
+    save_model_state(indiv, indiv_path, new_last_date)
+
+    # ── 全局模型（滑动窗口250天） ──
+    MAX_HISTORY = 250
     gx, gy = [], []
     for fc, fd in all_fund_data.items():
-        for j in range(train_start, n):
-            if j < len(fd["features"]) and fd["targets"][j] is not None:
+        nf = len(fd["features"])
+        start = max(0, nf - MAX_HISTORY - 1)
+        for j in range(start, nf - 1):
+            if fd["targets"][j] is not None:
                 gx.append(fd["features"][j]); gy.append(fd["targets"][j]["return"])
     gm = RidgeModel(alpha=alpha, lr=0.01, n_epochs=200)
     if len(gx) >= 10: gm.fit(gx, gy)
     g_pred = gm.predict(last_feat)
 
+    # ── 板块模型（滑动窗口250天） ──
     sx, sy = [], []
     for sf in [f for f in FUNDS if f["sector"] == sector]:
         if sf["code"] in all_fund_data:
             fd = all_fund_data[sf["code"]]
-            for j in range(train_start, n):
-                if j < len(fd["features"]) and fd["targets"][j] is not None:
+            nf = len(fd["features"])
+            start = max(0, nf - MAX_HISTORY - 1)
+            for j in range(start, nf - 1):
+                if fd["targets"][j] is not None:
                     sx.append(fd["features"][j]); sy.append(fd["targets"][j]["return"])
     sm = RidgeModel(alpha=alpha, lr=0.01, n_epochs=200)
     if len(sx) >= 5: sm.fit(sx, sy)
     s_pred = sm.predict(last_feat)
 
-    ind_w = min(train_window, 26); ind_start = max(0, n - ind_w)
-    ix, iy = [], []
-    for j in range(ind_start, n):
-        if j < len(fund_feats) and fund_tgts[j] is not None:
-            ix.append(fund_feats[j]); iy.append(fund_tgts[j]["return"])
-    im = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=200)
-    if len(ix) >= 5: im.fit(ix, iy)
-    i_pred = im.predict(last_feat)
+    # ── 个体预测 ──
+    i_pred = indiv.predict(last_feat)
 
-    ni = len(ix)
-    if ni >= 15: final = 0.25*g_pred + 0.25*s_pred + 0.5*i_pred
-    elif ni >= 5: final = 0.35*g_pred + 0.35*s_pred + 0.3*i_pred
-    else: final = 0.5*g_pred + 0.5*s_pred
+    # ── 性能加权集成（近60天个体模型方向准确率 → 动态调权） ──
+    ni = len(indiv.feature_names) if indiv.feature_names else 1
+    ns, ng = len(sx), len(gx)
+    total_dc = ni + ns + ng
+    w_g_dc = ng / total_dc if total_dc > 0 else 1/3
+    w_s_dc = ns / total_dc if total_dc > 0 else 1/3
+    w_i_dc = ni / total_dc if total_dc > 0 else 1/3
+
+    # 检查个体模型近期准确率
+    perf_window = min(60, n - 1)
+    if perf_window >= 15 and indiv.trained:
+        i_correct = 0; i_total = 0
+        for t in range(max(0, n - perf_window - 1), n - 1):
+            if fund_tgts[t] is None: continue
+            pv = indiv.predict(fund_feats[t])
+            av = fund_tgts[t]["return"]
+            if (pv > 0 and av > 0) or (pv < 0 and av < 0):
+                i_correct += 1
+            i_total += 1
+        i_acc = i_correct / max(i_total, 1)
+
+        # 根据准确率调整权重
+        if i_acc < 0.35 and i_total >= 10:
+            # 严重差 → 大幅压低个体权重
+            penalty = 0.6
+            w_i = w_i_dc * (1 - penalty)
+            shift = w_i_dc * penalty
+            w_g = w_g_dc + shift * 0.6
+            w_s = w_s_dc + shift * 0.4
+        elif i_acc < 0.45 and i_total >= 10:
+            # 较差 → 适度压低
+            penalty = 0.3
+            w_i = w_i_dc * (1 - penalty)
+            shift = w_i_dc * penalty
+            w_g = w_g_dc + shift * 0.6
+            w_s = w_s_dc + shift * 0.4
+        else:
+            w_i, w_g, w_s = w_i_dc, w_g_dc, w_s_dc
+    else:
+        w_i, w_g, w_s = w_i_dc, w_g_dc, w_s_dc
+
+    final = w_g * g_pred + w_s * s_pred + w_i * i_pred
 
     return final, g_pred, s_pred, i_pred
 
 # ========== 日级别交易策略 ==========
-def generate_daily_advice(fund_data, weekly_prediction, today):
-    """
-    根据周预测和本周已实现收益，给出今天的操作建议
-    
-    逻辑：
-    - 周初：看周预测方向，给大方向建议
-    - 周中：对比已实现 vs 预期，判断进度
-    - 周末：评估本周表现，预判下周
-    """
+def generate_daily_advice(fund_data, daily_prediction, today):
+    """根据明日预测给出今日操作建议"""
     daily = fund_data["daily"]
     if len(daily) < 2:
-        return {"action": "观望", "reason": "数据不足", "progress": 0}
+        return {"action": "观望", "reason": "数据不足", "today_change": 0, "pred_pct": 0}
 
-    # 本周已实现收益
-    last_nav = daily[-1]["nav"]
-    last_date = daily[-1]["date"]
+    today_change = (daily[-1]["nav"] - daily[-2]["nav"]) / daily[-2]["nav"] * 100
+    pred_pct = daily_prediction * 100
 
-    # 找到本周一的净值
-    today_dt = datetime.strptime(last_date, "%Y-%m-%d")
-    weekday = today_dt.weekday()  # 0=Mon, 4=Fri
-
-    # 找本周起始净值
-    week_start_nav = None
-    for i in range(len(daily)-1, -1, -1):
-        d = datetime.strptime(daily[i]["date"], "%Y-%m-%d")
-        if d.weekday() == 0:  # Monday
-            week_start_nav = daily[i]["nav"]
-            break
-        elif d < today_dt - timedelta(days=weekday):
-            week_start_nav = daily[i]["nav"]
-            break
-
-    if week_start_nav is None and len(daily) >= 2:
-        week_start_nav = daily[-2]["nav"]
-
-    if week_start_nav and week_start_nav > 0:
-        week_actual = (last_nav - week_start_nav) / week_start_nav * 100
-    else:
-        week_actual = 0
-
-    # 今日涨跌
-    if len(daily) >= 2:
-        today_change = (daily[-1]["nav"] - daily[-2]["nav"]) / daily[-2]["nav"] * 100
-    else:
-        today_change = 0
-
-    pred_pct = weekly_prediction * 100
-
-    # 预测进度（本周已实现占预测的比例）
-    if abs(pred_pct) > 0.01:
-        progress = week_actual / pred_pct * 100
-    else:
-        progress = 0
-
-    # 生成建议
-    if weekday == 0:  # 周一
-        if pred_pct > 1:
-            action, reason = "加仓", f"周预测+{pred_pct:.1f}%，周初建仓好时机"
-        elif pred_pct < -1:
-            action, reason = "减持", f"周预测{pred_pct:.1f}%，考虑减仓避险"
+    if pred_pct > 0.3:
+        if today_change < -0.5:
+            action, reason = "加仓", f"预测明日+{pred_pct:.2f}%，今日回调{today_change:+.1f}%，可逢低布局"
         else:
-            action, reason = "持有", f"周预测{pred_pct:+.1f}%，波动不大先观望"
-    elif weekday >= 4:  # 周五
-        if progress > 80:
-            action, reason = "持有", f"本周预测已兑现{progress:.0f}%，保持仓位"
-        elif progress < -50:
-            action, reason = "观望", f"预测方向与实际相反，等待下周"
+            action, reason = "买入", f"预测明日上涨{pred_pct:.2f}%，可适当加仓"
+    elif pred_pct < -0.3:
+        if today_change > 0.5:
+            action, reason = "减持", f"预测明日下跌{pred_pct:.2f}%，今日反弹{today_change:+.1f}%可减仓"
         else:
-            action, reason = "持有", "周五不做大调整，等下周"
-    else:  # 周二~周四
-        if pred_pct > 1:
-            if progress < 30:
-                if today_change < -0.5:
-                    action, reason = "加仓", f"回调中，预测+{pred_pct:.1f}%但才涨了{week_actual:.1f}%，逢低加仓"
-                else:
-                    action, reason = "持有", f"预测+{pred_pct:.1f}%，进度{progress:.0f}%，继续持有"
-            elif progress > 120:
-                action, reason = "减仓", f"预测已超额兑现（{progress:.0f}%），考虑部分获利"
-            else:
-                action, reason = "持有", f"进度正常（{progress:.0f}%），继续持有"
-        elif pred_pct < -1:
-            if progress > 50:
-                action, reason = "观望", f"已跌{abs(week_actual):.1f}%，接近预测跌幅，暂不操作"
-            elif today_change < -1:
-                action, reason = "观望", f"今日跌{today_change:.1f}%，恐慌中不追卖"
-            else:
-                action, reason = "减持", f"预测{pred_pct:.1f}%，考虑减仓"
+            action, reason = "观望", f"预测明日下跌{pred_pct:.2f}%，暂不操作"
+    else:
+        if abs(today_change) > 1.5:
+            action, reason = "观望", f"今日波动大({today_change:+.1f}%)，明日方向不明"
         else:
-            if abs(today_change) > 1.5:
-                action, reason = "观望", f"今日波动大({today_change:+.1f}%)，但周预测震荡，不追涨杀跌"
-            else:
-                action, reason = "持有", "预测震荡，保持现有仓位"
+            action, reason = "持有", f"预测{pred_pct:+.2f}%，波动不大继续持有"
 
     return {
         "action": action,
         "reason": reason,
-        "week_actual": round(week_actual, 3),
         "today_change": round(today_change, 3),
-        "progress": round(progress, 1),
-        "weekday": weekday,
+        "pred_pct": round(pred_pct, 3),
     }
 
 # ========== 预测记录管理 ==========
@@ -340,65 +583,66 @@ def load_predictions():
     except:
         return {"version": "1.0", "predictions": []}
 
-def save_prediction(pred_data):
+def save_daily_prediction(pred_data):
     data = load_predictions()
     data["predictions"].append(pred_data)
-    # 只保留最近52周
-    data["predictions"] = data["predictions"][-52:]
+    data["predictions"] = data["predictions"][-365:]  # 保留近1年
     with open(PREDICTIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def get_current_week_prediction():
-    """获取本周的预测记录"""
-    data = load_predictions()
-    today = datetime.now()
-    this_week = today.isocalendar()[:2]
-    for p in reversed(data["predictions"]):
-        p_date = datetime.strptime(p["date"], "%Y-%m-%d")
-        if p_date.isocalendar()[:2] == this_week:
-            return p
-    return None
-
-# ========== 历史准确率 ==========
-def calc_accuracy(fund_code, sector, all_fund_data):
+# ========== 在线准确率回测 ==========
+def calc_accuracy_daily(fund_code, sector, all_fund_data):
+    """在线学习回测：用前60天训练，然后在后续每天做 predict→update→compare"""
     params = BEST_PARAMS.get(fund_code, (36, 0.1))
-    tw, alpha = params
+    alpha = params[1]
     ff = all_fund_data[fund_code]["features"]
     ft = all_fund_data[fund_code]["targets"]
     n = len(ff)
-    if n < 35: return 0
+    if n < 80: return 0  # 日频至少需要80个样本
+
     correct = total = 0
-    for wi in range(max(30, n-20), n-1):
+    sq_err_sum = 0.0
+    test_start = max(60, n - 60)
+
+    # 初始训练
+    model = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=500)
+    train_X = ff[:test_start]
+    train_y = [t["return"] for t in ft[:test_start] if t is not None]
+    if len(train_X) >= 30:
+        model.fit(train_X, train_y)
+    else:
+        return 0
+
+    # 在线回测
+    for wi in range(test_start, n - 1):
         if ft[wi] is None: continue
-        ts = max(0, wi - tw)
-        gx, gy = [], []
-        for fc, fd in all_fund_data.items():
-            for j in range(ts, wi):
-                if j < len(fd["features"]) and fd["targets"][j] is not None:
-                    gx.append(fd["features"][j]); gy.append(fd["targets"][j]["return"])
-        m = RidgeModel(alpha=alpha, lr=0.01, n_epochs=200)
-        if len(gx) >= 10: m.fit(gx, gy)
-        pred = m.predict(ff[wi])
+        pred = model.predict(ff[wi])
         actual = ft[wi]["return"]
-        if (pred > 0 and actual > 0) or (pred < 0 and actual < 0): correct += 1
+        if (pred > 0 and actual > 0) or (pred < 0 and actual < 0):
+            correct += 1
+        sq_err_sum += (pred - actual) ** 2
         total += 1
+        # 在线更新：预测完立即学
+        model.partial_fit([ff[wi]], [actual], n_epochs=3)
+
+    rmse = math.sqrt(sq_err_sum / total) if total > 0 else 0
+    if rmse > 0.001:
+        print(f"    {fund_code} RMSE={rmse:.4f} 方向准确率={correct}/{total}")
     return round(correct/total*100, 1) if total > 0 else 0
 
 # ========== HTML生成 ==========
-def generate_html(results, update_time, is_daily=False):
-    """生成仪表盘式HTML"""
-
+def generate_html(results, update_time):
+    """生成仪表盘式HTML（日预测版）"""
     now = datetime.now()
     weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     today_name = weekday_names[now.weekday()]
 
     # 统计
-    bull = sum(1 for r in results if r["final_pred"] > 0.01)
-    bear = sum(1 for r in results if r["final_pred"] < -0.01)
+    bull = sum(1 for r in results if r["final_pred"] > 0.003)
+    bear = sum(1 for r in results if r["final_pred"] < -0.003)
     flat = len(results) - bull - bear
 
-    # 建议统计
-    add_count = sum(1 for r in results if r.get("advice", {}).get("action") in ["加仓"])
+    add_count = sum(1 for r in results if r.get("advice", {}).get("action") in ["加仓", "买入"])
     reduce_count = sum(1 for r in results if r.get("advice", {}).get("action") in ["减持", "减仓"])
     hold_count = len(results) - add_count - reduce_count
 
@@ -407,111 +651,74 @@ def generate_html(results, update_time, is_daily=False):
     for r in results:
         pred_pct = r["final_pred"] * 100
         pred_color = "#e74c3c" if pred_pct < 0 else "#27ae60"
-        pred_arrow = "📈" if pred_pct > 1 else ("📉" if pred_pct < -1 else "➡️")
-
+        pred_arrow = "📈" if pred_pct > 0.3 else ("📉" if pred_pct < -0.3 else "➡️")
         advice = r.get("advice", {})
         action = advice.get("action", "—")
         reason = advice.get("reason", "")
         today_chg = advice.get("today_change", 0)
-        week_act = advice.get("week_actual", 0)
-        progress = advice.get("progress", 0)
         accuracy = r.get("accuracy", 0)
-
-        action_color = {"加仓": "#27ae60", "减持": "#e74c3c", "减仓": "#e74c3c", "持有": "#3498db", "观望": "#95a5a6"}.get(action, "#333")
-        action_icon = {"加仓": "🟢", "减持": "🔴", "减仓": "🔴", "持有": "🔵", "观望": "⚪"}.get(action, "⚪")
-
+        action_color = {"加仓": "#27ae60", "买入": "#27ae60", "减持": "#e74c3c", "减仓": "#e74c3c", "持有": "#3498db", "观望": "#95a5a6"}.get(action, "#333")
+        action_icon = {"加仓": "🟢", "买入": "🟢", "减持": "🔴", "减仓": "🔴", "持有": "🔵", "观望": "⚪"}.get(action, "⚪")
         today_color = "#e74c3c" if today_chg < 0 else "#27ae60"
-        week_color = "#e74c3c" if week_act < 0 else "#27ae60"
         acc_color = "#27ae60" if accuracy >= 55 else ("#e67e22" if accuracy >= 50 else "#e74c3c")
-
-        # 进度条
-        prog_width = min(max(abs(progress), 0), 150)
-        prog_color = "#27ae60" if 0 < progress < 120 else ("#e74c3c" if progress > 120 or progress < -50 else "#f39c12")
 
         table_rows += f"""
         <tr>
             <td class="fund-name-cell">{r['name']}</td>
             <td class="sector-cell">{SECTORS.get(r['sector'], {}).get('name', '')}</td>
             <td style="color:{today_color};font-weight:600">{today_chg:+.2f}%</td>
-            <td style="color:{week_color};font-weight:600">{week_act:+.2f}%</td>
             <td style="color:{pred_color};font-weight:600">{pred_arrow} {pred_pct:+.2f}%</td>
-            <td>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width:{prog_width}%;background:{prog_color}"></div>
-                </div>
-                <span class="progress-text">{progress:.0f}%</span>
-            </td>
             <td style="color:{acc_color}">{accuracy}%</td>
             <td style="color:{action_color};font-weight:700">{action_icon} {action}</td>
             <td class="reason-cell">{reason}</td>
         </tr>"""
 
-    # 详细图表 — 支付宝风格时间区间切换
     detail_cards = ""
     charts_data = {}
     colors = ["#3498db", "#e74c3c", "#27ae60", "#f39c12", "#9b59b6", "#1abc9c", "#e67e22"]
 
     for idx, r in enumerate(results):
         c = colors[idx % len(colors)]
-        hist = r["history"]  # 全部历史数据
+        hist = r["history"]
         all_dates = [h["date"] for h in hist]
         all_navs = [h["nav"] for h in hist]
 
-        # 找到该基金的交易记录
         fund_txns = [t for t in TRANSACTIONS if t["code"] == r["code"]]
         txn_markers = []
         for t in fund_txns:
-            # 找到最近的交易日期净值
             nav_at_date = None
             for h in hist:
                 if h["date"] >= t["date"]:
-                    nav_at_date = h["nav"]
-                    break
+                    nav_at_date = h["nav"]; break
             if nav_at_date:
-                txn_markers.append({
-                    "date": t["date"],
-                    "type": t["type"],
-                    "amount": t.get("amount", 0),
-                    "nav": nav_at_date,
-                    "note": t.get("note", "")
-                })
+                txn_markers.append({"date": t["date"], "type": t["type"], "amount": t.get("amount", 0), "nav": nav_at_date, "note": t.get("note", "")})
 
-        # 生成预测净值（未来5个交易日）
-        pred_dates = []
-        pred_navs = []
+        # 预测未来1个交易日
+        pred_dates, pred_navs = [], []
         if all_navs:
             last_nav = all_navs[-1]
             last_date = datetime.strptime(all_dates[-1], "%Y-%m-%d")
-            daily_pred = r["final_pred"] / 5  # 周预测拆成5天
-            nav = last_nav
-            for d in range(1, 6):
-                next_date = last_date + timedelta(days=d)
-                # 跳过周末
-                while next_date.weekday() >= 5:
-                    next_date += timedelta(days=1)
-                nav = nav * (1 + daily_pred)
-                pred_dates.append(next_date.strftime("%Y-%m-%d"))
-                pred_navs.append(round(nav, 4))
+            next_date = last_date + timedelta(days=1)
+            while next_date.weekday() >= 5:
+                next_date += timedelta(days=1)
+            pred_nav = last_nav * (1 + r["final_pred"])
+            pred_dates.append(next_date.strftime("%Y-%m-%d"))
+            pred_navs.append(round(pred_nav, 4))
 
-        # 计算加权平均买入价
         buy_navs = [t["nav"] for t in txn_markers if t["type"] in ("买入", "转入")]
         avg_buy_nav = sum(buy_navs) / len(buy_navs) if buy_navs else None
 
         charts_data[idx] = {
             "dates": all_dates, "navs": all_navs, "color": c,
-            "txns": txn_markers,
-            "pred_dates": pred_dates, "pred_navs": pred_navs,
-            "pred_pct": r["final_pred"] * 100,
-            "buy_price": avg_buy_nav
+            "txns": txn_markers, "pred_dates": pred_dates, "pred_navs": pred_navs,
+            "pred_pct": r["final_pred"] * 100, "buy_price": avg_buy_nav
         }
 
-        advice = r.get("advice", {})
         pred_pct = r["final_pred"] * 100
-        action = advice.get("action", "—")
-        reason = advice.get("reason", "")
-        action_color = {"加仓": "#27ae60", "减持": "#e74c3c", "减仓": "#e74c3c", "持有": "#3498db", "观望": "#95a5a6"}.get(action, "#333")
+        action = r.get("advice", {}).get("action", "—")
+        reason = r.get("advice", {}).get("reason", "")
+        action_color = {"加仓": "#27ae60", "买入": "#27ae60", "减持": "#e74c3c", "减仓": "#e74c3c", "持有": "#3498db", "观望": "#95a5a6"}.get(action, "#333")
 
-        # 计算各时间段涨跌幅
         nav_now = all_navs[-1] if all_navs else 0
         periods = {"1月": 22, "3月": 66, "6月": 132, "1年": 252}
         perf_html = ""
@@ -526,7 +733,7 @@ def generate_html(results, update_time, is_daily=False):
             <div class="dc-header">
                 <span class="dc-name" style="border-left:4px solid {c}">{r['name']}</span>
                 <span class="dc-nav">最新 {all_navs[-1]:.4f}</span>
-                <span class="dc-pred" style="color:{'#e74c3c' if pred_pct<0 else '#27ae60'}">预测 {pred_pct:+.2f}%</span>
+                <span class="dc-pred" style="color:{'#e74c3c' if pred_pct<0 else '#27ae60'}">明日 {pred_pct:+.2f}%</span>
                 <span class="dc-action" style="color:{action_color};background:{action_color}15;padding:2px 10px;border-radius:12px;font-weight:600">{action}</span>
             </div>
             <div class="dc-perf">{perf_html}</div>
@@ -544,10 +751,10 @@ def generate_html(results, update_time, is_daily=False):
                 <span>全局 {r['global_pred']*100:+.2f}%</span>
                 <span>板块 {r['sector_pred']*100:+.2f}%</span>
                 <span>个体 {r['individual_pred']*100:+.2f}%</span>
+                <span style="color:#888">在线校准 ✓</span>
             </div>
         </div>"""
 
-    # 整体建议
     if add_count > reduce_count + 2:
         overall = "📈 偏进攻"
         overall_desc = f"多数基金看涨（{bull}只），可以适当加仓"
@@ -563,19 +770,15 @@ def generate_html(results, update_time, is_daily=False):
 
     html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <script src="chart.min.js"></script>
-<title>基金预测 v4 — {today_name}</title>
+<title>基金预测 v6 — {today_name}</title>
 
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;color:#333;padding:12px;max-width:1200px;margin:0 auto}}
 .header{{text-align:center;padding:20px 0 12px}}.header h1{{font-size:22px;color:#1a1a2e;margin-bottom:4px}}.header .sub{{color:#888;font-size:12px}}
-
-/* 仪表盘 */
 .dashboard{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px;margin-bottom:16px}}
 .dash-card{{background:white;border-radius:10px;padding:14px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.06)}}
 .dash-card .label{{font-size:11px;color:#999;margin-bottom:4px}}.dash-card .value{{font-size:22px;font-weight:700}}
-
-/* 总表 */
 .table-wrap{{background:white;border-radius:10px;padding:14px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);overflow-x:auto}}
 .table-wrap h2{{font-size:16px;margin-bottom:12px;color:#1a1a2e}}
 table{{width:100%;border-collapse:collapse;font-size:13px}}
@@ -585,15 +788,8 @@ tr:hover{{background:#f8f9fb}}
 .fund-name-cell{{font-weight:600;color:#1a1a2e;min-width:100px}}
 .sector-cell{{color:#888;font-size:12px}}
 .reason-cell{{font-size:12px;color:#666;max-width:250px;white-space:normal}}
-.progress-bar{{display:inline-block;width:60px;height:6px;background:#eee;border-radius:3px;vertical-align:middle}}
-.progress-fill{{height:100%;border-radius:3px;transition:width 0.3s}}
-.progress-text{{font-size:10px;color:#999;margin-left:4px}}
-
-/* 整体建议 */
 .overall{{background:white;border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);border-left:4px solid {overall_color}}}
 .overall h3{{color:{overall_color};font-size:18px;margin-bottom:4px}}.overall p{{color:#666;font-size:13px}}
-
-/* 详细卡片 — 支付宝风格 */
 .detail-card{{background:white;border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 2px 8px rgba(0,0,0,0.04)}}
 .dc-header{{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}}
 .dc-name{{font-weight:700;padding-left:10px;font-size:15px;color:#1a1a2e}}
@@ -611,21 +807,20 @@ tr:hover{{background:#f8f9fb}}
 .dc-chart{{height:200px;margin-bottom:8px;position:relative}}
 .dc-reason{{font-size:12px;color:#888;margin-bottom:6px;padding-left:10px;font-style:italic}}
 .dc-layers{{display:flex;gap:16px;font-size:11px;color:#aaa;padding-left:10px}}
-
 .disclaimer{{text-align:center;padding:16px;color:#aaa;font-size:11px}}
 </style></head><body>
 
 <div class="header">
     <h1>📊 基金预测仪表盘</h1>
-    <div class="sub">{update_time} · {today_name} · 三层模型v4 · 每日更新</div>
+    <div class="sub">{update_time} · {today_name} · 日频v6 · 3日平滑目标+多项式特征+量能+日历+性能加权</div>
 </div>
 
 <div class="dashboard">
     <div class="dash-card"><div class="label">📈 看涨</div><div class="value" style="color:#27ae60">{bull}</div></div>
     <div class="dash-card"><div class="label">📉 看跌</div><div class="value" style="color:#e74c3c">{bear}</div></div>
     <div class="dash-card"><div class="label">➡️ 震荡</div><div class="value" style="color:#f39c12">{flat}</div></div>
-    <div class="dash-card"><div class="label">🟢 加仓</div><div class="value" style="color:#27ae60">{add_count}</div></div>
-    <div class="dash-card"><div class="label">🔴 减仓</div><div class="value" style="color:#e74c3c">{reduce_count}</div></div>
+    <div class="dash-card"><div class="label">🟢 买入/加仓</div><div class="value" style="color:#27ae60">{add_count}</div></div>
+    <div class="dash-card"><div class="label">🔴 减持</div><div class="value" style="color:#e74c3c">{reduce_count}</div></div>
     <div class="dash-card"><div class="label">⏰ 时间</div><div class="value" style="color:#3498db;font-size:16px">{today_name}</div></div>
 </div>
 
@@ -635,12 +830,11 @@ tr:hover{{background:#f8f9fb}}
 </div>
 
 <div class="table-wrap">
-    <h2>📋 交易指导总表</h2>
+    <h2>📋 交易指导总表（明日预测）</h2>
     <table>
         <thead>
             <tr>
-                <th>基金</th><th>板块</th><th>今日涨跌</th><th>本周累计</th><th>下周预测</th>
-                <th>预测进度</th><th>历史准确率</th><th>操作建议</th><th>原因</th>
+                <th>基金</th><th>板块</th><th>今日涨跌</th><th>明日预测</th><th>历史准确率</th><th>操作建议</th><th>原因</th>
             </tr>
         </thead>
         <tbody>{table_rows}</tbody>
@@ -650,9 +844,8 @@ tr:hover{{background:#f8f9fb}}
 <h2 style="font-size:16px;margin:16px 0 10px;padding-left:4px">📈 详细走势</h2>
 {detail_cards}
 
-<div class="disclaimer">⚠️ 预测仅供参考，不构成投资建议 · 模型：三层Ridge回归 + Grid Search最优参数 · AI情绪层待接入</div>
+<div class="disclaimer">⚠️ 预测仅供参考，不构成投资建议 · 3日平滑目标 + 多项式特征 · 性能加权集成 + 滑动窗口 · 个体在线校准</div>
 <script>
-// 支付宝风格图表 — 时间区间切换 + 买卖标记 + 预测线
 const FUND_DATA = {json.dumps(charts_data)};
 const charts = {{}};
 
@@ -675,23 +868,18 @@ function createChart(idx, days) {{
     const slicedDates = fd.dates.slice(range.startIdx);
     const slicedNavs = fd.navs.slice(range.startIdx);
 
-    // 预测数据
     const predDates = fd.pred_dates || [];
     const predNavs = fd.pred_navs || [];
 
-    // 合并显示（历史+预测）
     const allLabels = slicedDates.concat(predDates);
     const histData = slicedNavs.concat(Array(predDates.length).fill(null));
-    // 预测线从历史最后一个点开始
     const predLine = Array(slicedDates.length - 1).fill(null).concat([slicedNavs[slicedNavs.length-1]]).concat(predNavs);
 
-    // 涨跌颜色
     const firstNav = slicedNavs[0];
     const lastNav = slicedNavs[slicedNavs.length-1];
     const changePct = ((lastNav - firstNav) / firstNav * 100);
     const lineColor = changePct >= 0 ? '#e74c3c' : '#27ae60';
 
-    // 买卖标记
     const txns = (fd.txns || []).filter(t => t.date >= slicedDates[0]);
     const buyPoints = [];
     const sellPoints = [];
@@ -716,7 +904,6 @@ function createChart(idx, days) {{
             borderColor: lineColor,
             borderWidth: 2,
             pointRadius: function(ctx) {{
-                // 买卖点加大
                 const d = allLabels[ctx.dataIndex];
                 if (buyPoints.find(b => b.x === d) || sellPoints.find(s => s.x === d)) return 6;
                 return 0;
@@ -744,7 +931,7 @@ function createChart(idx, days) {{
             spanGaps: false
         }},
         {{
-            label: '预测净值',
+            label: '明日预测',
             data: predLine,
             borderColor: '#f39c12',
             borderWidth: 2,
@@ -774,7 +961,6 @@ function createChart(idx, days) {{
         }}
     ];
 
-    // 买入价为空时移除该数据集
     if (!fd.buy_price) datasets.pop();
 
     charts[idx] = new Chart(ctx, {{
@@ -792,7 +978,7 @@ function createChart(idx, days) {{
                     labels: {{
                         boxWidth: 12, padding: 8, font: {{ size: 10 }},
                         usePointStyle: true,
-                        filter: function(item) {{ return item.text === '预测净值' || item.text === '买入价'; }}
+                        filter: function(item) {{ return item.text === '明日预测' || item.text === '买入价'; }}
                     }}
                 }},
                 tooltip: {{
@@ -845,7 +1031,6 @@ function switchPeriod(btn) {{
     createChart(idx, days);
 }}
 
-// Init all charts with 6月 default
 document.addEventListener('DOMContentLoaded', function() {{
     for (let idx in FUND_DATA) {{
         createChart(idx, 132);
@@ -860,43 +1045,75 @@ def main():
     now = datetime.now()
     update_time = now.strftime("%Y-%m-%d %H:%M")
     weekday = now.weekday()
-    is_daily = True  # 现在默认日更
 
-    print(f"[{update_time}] 基金预测 v4 — 日级别")
+    print(f"[{update_time}] 基金预测 v6 — 日级别在线学习（3日平滑目标）")
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # 抓取数据
+    # 1. 大盘数据（日线）+ 成交量
     print("  大盘...", end=" ")
-    market_weekly = []
+    market_daily = []
+    market_kline_list = []
     for name, code in MARKET_INDICES.items():
         data = fetch_sina_kline(code, 999)
-        market_weekly.append(calc_returns(daily_to_weekly(data, "close"), "close"))
+        if data:
+            market_daily.append(calc_returns(data, "close"))
+            market_kline_list.append(data)
         time.sleep(0.2)
     print("OK")
 
+    # 大盘成交量字典 (date→平均成交量)
+    market_vol_by_date = {}
+    for mk in market_kline_list:
+        for d in mk:
+            market_vol_by_date[d["date"]] = market_vol_by_date.get(d["date"], 0) + d["volume"]
+    for k in market_vol_by_date:
+        market_vol_by_date[k] /= len(market_kline_list) if market_kline_list else 1
+
+    # 2. 板块数据（日线）+ 成交量
     print("  板块...", end=" ")
-    sector_weekly = {}
+    sector_daily = {}
+    sector_kline = {}
     for sc, si in SECTORS.items():
         data = fetch_sina_kline(si["index"], 999)
-        sector_weekly[sc] = calc_returns(daily_to_weekly(data, "close"), "close")
+        if data:
+            sector_daily[sc] = calc_returns(data, "close")
+            sector_kline[sc] = data
         time.sleep(0.2)
     print("OK")
 
+    # 3. 基金数据 + 日级别特征（含量能/日历）
     all_fund_data = {}
     for fund in FUNDS:
         fc = fund["code"]
         print(f"  {fund['name']}...", end=" ")
-        daily = fetch_fund_nav_all(fc)
-        if not daily:
-            print("FAILED")
-            continue
-        weekly = daily_to_weekly(daily)
-        returns = calc_returns(weekly)
-        features, targets = build_features(returns, sector_weekly.get(fund["sector"], []), market_weekly)
-        all_fund_data[fc] = {"features": features, "targets": targets, "daily": daily, "returns": returns}
-        print(f"OK ({len(daily)}d)")
+        daily_nav = fetch_fund_nav_all(fc)
+        if not daily_nav:
+            print("FAILED"); continue
 
-    # 预测 + 交易建议
-    print("\n  预测 & 交易建议...")
+        daily_returns = calc_returns(daily_nav, "nav")
+
+        # 板块成交量字典 (date→成交量)
+        sector_vol_by_date = {}
+        if fund["sector"] in sector_kline:
+            for d in sector_kline[fund["sector"]]:
+                sector_vol_by_date[d["date"]] = d["volume"]
+
+        # 特征工程（日级别）
+        features, targets = build_features_daily(
+            daily_returns,
+            sector_daily.get(fund["sector"], []),
+            market_daily,
+            sector_vol_by_date=sector_vol_by_date,
+            market_vol_by_date=market_vol_by_date,
+        )
+        all_fund_data[fc] = {
+            "features": features, "targets": targets,
+            "daily": daily_nav, "returns": daily_returns
+        }
+        print(f"OK ({len(daily_nav)}d → {len(features)}特征)")
+
+    # 4. 预测 + 在线校准
+    print("\n  预测 & 在线校准...")
     results = []
     for fund in FUNDS:
         fc = fund["code"]
@@ -904,8 +1121,8 @@ def main():
             continue
         fd = all_fund_data[fc]
 
-        final, g, s, i = predict_fund(all_fund_data, fc, fund["sector"])
-        accuracy = calc_accuracy(fc, fund["sector"], all_fund_data)
+        final, g, s, i = predict_daily(all_fund_data, fc, fund["sector"], MODEL_DIR)
+        accuracy = calc_accuracy_daily(fc, fund["sector"], all_fund_data)
         advice = generate_daily_advice(fd, final, now)
 
         results.append({
@@ -917,29 +1134,27 @@ def main():
 
         pct = final * 100
         a = advice["action"]
-        icon = {"加仓": "🟢", "减持": "🔴", "减仓": "🔴", "持有": "🔵", "观望": "⚪"}.get(a, "⚪")
-        print(f"  {icon} {fund['name']}: 预测{pct:+.2f}% | 今日{advice['today_change']:+.2f}% | 本周{advice['week_actual']:+.2f}% | → {a} ({advice['reason']})")
+        icon = {"加仓": "🟢", "买入": "🟢", "减持": "🔴", "减仓": "🔴", "持有": "🔵", "观望": "⚪"}.get(a, "⚪")
+        print(f"  {icon} {fund['name']}: 明日{pct:+.2f}% | 今日{advice['today_change']:+.2f}% | → {a} ({advice['reason']})")
 
-    # 保存本周预测
-    if weekday == 0 or get_current_week_prediction() is None:
-        pred_record = {
-            "date": now.strftime("%Y-%m-%d"),
-            "funds": {r["code"]: {"predicted": round(r["final_pred"]*100, 3), "name": r["name"]} for r in results}
-        }
-        save_prediction(pred_record)
-        print("  📝 已保存本周预测记录")
+    # 5. 保存预测记录
+    daily_record = {
+        "date": now.strftime("%Y-%m-%d"),
+        "type": "daily",
+        "funds": {r["code"]: {"predicted": round(r["final_pred"]*100, 3), "name": r["name"]} for r in results}
+    }
+    save_daily_prediction(daily_record)
+    print("  📝 已保存今日预测记录")
 
-    # 生成HTML
-    html = generate_html(results, update_time, is_daily)
+    # 6. 生成HTML
+    html = generate_html(results, update_time)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(html)
 
-    # Copy chart.min.js to same directory as HTML
     import shutil
     chart_src = os.path.join(SCRIPT_DIR, "chart.min.js")
     chart_dst = os.path.join(os.path.dirname(OUTPUT_FILE), "chart.min.js")
-    # 如果输出到网站目录，也复制一份到那里
     if "mysite" in OUTPUT_FILE:
         chart_dst = os.path.join(os.path.expanduser("~/mysite"), "chart.min.js")
     if os.path.exists(chart_src) and chart_src != chart_dst:
