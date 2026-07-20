@@ -684,9 +684,50 @@ def predict_daily(all_fund_data, fund_code, sector, model_dir):
 
     return final, final, final, final
 
+# ========== 自适应阈值 + 置信度评分 ==========
+def calc_adaptive_threshold(daily_returns, base_threshold=0.15, window=20):
+    """根据近期波动率动态调整阈值
+    波动大→阈值放宽（避免噪声交易）
+    波动小→阈值收窄（抓住小趋势）
+    """
+    if len(daily_returns) < window:
+        return base_threshold
+    recent_rets = [r["return"] * 100 for r in daily_returns[-window:]]  # 转%
+    avg_vol = sum(abs(r) for r in recent_rets) / window
+    # 基准波动率 1.0% = 阈值 0.15%，线性缩放
+    dynamic = base_threshold * (avg_vol / 1.0)
+    return max(0.08, min(0.40, dynamic))  # 限制在 0.08%~0.40%
+
+def calc_confidence(pred_pct, threshold, recent_accuracy, today_vol_pct):
+    """计算预测置信度 0-100
+    因素：预测幅度 / 阈值 + 历史准确率 + 今日波动修正
+    """
+    # 1. 信号强度：预测值超出阈值的倍数
+    if abs(pred_pct) < threshold:
+        signal_score = abs(pred_pct) / threshold * 30  # <阈值时最多30分
+    else:
+        signal_score = min(40, 30 + (abs(pred_pct) - threshold) / threshold * 10)  # 超阈值累加
+
+    # 2. 历史准确率（0-40分）
+    if recent_accuracy > 0:
+        acc_score = max(0, min(40, (recent_accuracy - 50) * 0.8))  # 50%=0分，100%=40分
+    else:
+        acc_score = 20  # 无历史数据取中值
+
+    # 3. 今日波动修正：波动太大扣分（最多扣20）
+    if today_vol_pct > 3.0:
+        vol_penalty = min(20, today_vol_pct * 3)
+    else:
+        vol_penalty = 0
+
+    raw = signal_score + acc_score - vol_penalty
+    return max(0, min(100, raw))
+
+
 # ========== 日级别交易策略 ==========
-def generate_daily_advice(fund_data, daily_prediction, today):
-    """根据明日预测给出今日操作建议"""
+def generate_daily_advice(fund_data, daily_prediction, today, recent_accuracy=None,
+                           daily_returns=None, threshold=None, confidence=None):
+    """根据明日预测给出今日操作建议（支持自适应阈值+置信度）"""
     daily = fund_data["daily"]
     if len(daily) < 2:
         return {"action": "观望", "reason": "数据不足", "today_change": 0, "pred_pct": 0}
@@ -694,18 +735,40 @@ def generate_daily_advice(fund_data, daily_prediction, today):
     today_change = (daily[-1]["nav"] - daily[-2]["nav"]) / daily[-2]["nav"] * 100
     pred_pct = daily_prediction * 100
 
-    if pred_pct > 0.15:
-        if today_change < -0.5:
-            action, reason = "加仓", f"预测明日+{pred_pct:.2f}%，今日回调{today_change:+.1f}%，可逢低布局"
+    # 自适应阈值
+    if threshold is None and daily_returns:
+        threshold = calc_adaptive_threshold(daily_returns)
+    if threshold is None:
+        threshold = 0.15
+
+    # 置信度（如果外部没传，自行简单估算）
+    if confidence is None:
+        acc = recent_accuracy if recent_accuracy else 60
+        confidence = calc_confidence(pred_pct, threshold, acc, abs(today_change))
+
+    # 判断：低于阈值+低置信→持有/观望；超阈值+高置信→操作
+    if abs(pred_pct) < threshold * 0.5:
+        # 预测方向极弱
+        if abs(today_change) > 2.0:
+            action, reason = "观望", f"今日波动大({today_change:+.1f}%)，预测方向不明，多看少动"
         else:
-            action, reason = "买入", f"预测明日上涨{pred_pct:.2f}%，可适当加仓"
-    elif pred_pct < -0.15:
-        if today_change > 0.5:
-            action, reason = "减持", f"预测明日下跌{pred_pct:.2f}%，今日反弹{today_change:+.1f}%可减仓"
+            action, reason = "持有", f"预测{pred_pct:+.2f}%，波动不大继续持有"
+    elif pred_pct > threshold:
+        if today_change < -0.5 and confidence > 55:
+            action, reason = "加仓", f"自信度{confidence}%·预测明日+{pred_pct:.2f}%，今日回调{today_change:+.1f}%，可逢低布局"
+        elif confidence > 50:
+            action, reason = "买入", f"自信度{confidence}%·预测明日上涨{pred_pct:.2f}%，可适当加仓"
         else:
-            action, reason = "观望", f"预测明日下跌{pred_pct:.2f}%，暂不操作"
+            action, reason = "持有", f"自信度{confidence}%·预测+{pred_pct:.2f}%但信心不足，继续持有"
+    elif pred_pct < -threshold:
+        if today_change > 0.5 and confidence > 55:
+            action, reason = "减持", f"自信度{confidence}%·预测明日下跌{pred_pct:.2f}%，今日反弹{today_change:+.1f}%可减仓"
+        elif confidence > 50:
+            action, reason = "观望", f"自信度{confidence}%·预测明日下跌{pred_pct:.2f}%，暂不操作"
+        else:
+            action, reason = "观望", f"自信度{confidence}%·预测-{abs(pred_pct):.2f}%但信心不足，多看少动"
     else:
-        if abs(today_change) > 1.5:
+        if abs(today_change) > 2.0:
             action, reason = "观望", f"今日波动大({today_change:+.1f}%)，明日方向不明"
         else:
             action, reason = "持有", f"预测{pred_pct:+.2f}%，波动不大继续持有"
@@ -715,6 +778,8 @@ def generate_daily_advice(fund_data, daily_prediction, today):
         "reason": reason,
         "today_change": round(today_change, 3),
         "pred_pct": round(pred_pct, 3),
+        "confidence": round(confidence),
+        "threshold": round(threshold, 3),
     }
 
 # ========== 预测记录管理 ==========
@@ -1647,7 +1712,9 @@ def main():
         final, g, s, i = predict_daily(all_fund_data, fc, fund["sector"], MODEL_DIR)
         accuracy = calc_accuracy_daily(fc, fund["sector"], all_fund_data)
         acc_ens, acc_indiv = calc_accuracy_ensemble(fc, fund["sector"], all_fund_data)
-        advice = generate_daily_advice(fd, final, now)
+        advice = generate_daily_advice(fd, final, now,
+                                        recent_accuracy=accuracy,
+                                        daily_returns=fd.get("returns"))
 
         results.append({
             "code": fc, "name": fund["name"], "sector": fund["sector"],
@@ -1659,7 +1726,9 @@ def main():
         pct = final * 100
         a = advice["action"]
         icon = {"加仓": "🟢", "买入": "🟢", "减持": "🔴", "减仓": "🔴", "持有": "🔵", "观望": "⚪"}.get(a, "⚪")
-        print(f"  {icon} {fund['name']}: 明日{pct:+.2f}% | 今日{advice['today_change']:+.2f}% | → {a} ({advice['reason']})")
+        conf = advice.get("confidence", "?")
+        thr = advice.get("threshold", 0.15)
+        print(f"  {icon} {fund['name']}: {pct:+.2f}% | 自信度{conf}% | 阈值{thr:.2f}% | → {a}")
 
     # 5. 保存预测记录
     daily_record = {
