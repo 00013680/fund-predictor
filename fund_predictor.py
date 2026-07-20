@@ -320,11 +320,86 @@ def calc_macd(returns, fast=12, slow=26, signal=9):
     signal_line = calc_ema(macd_line, signal)
     return macd_line, signal_line
 
+
+# ========== 爬虫数据读取（从market_data.db） ==========
+SCRAPER_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_data.db")
+
+def load_scraper_news(sector_name, days=7):
+    """读取行业新闻评分"""
+    try:
+        conn = sqlite3.connect(SCRAPER_DB)
+        c = conn.cursor()
+        c.execute("""
+            SELECT AVG(impact_score) FROM industry_news 
+            WHERE sector_name=? AND ts >= datetime('now', '-{} days')
+        """.format(days), (sector_name,))
+        result = c.fetchone()
+        conn.close()
+        return result[0] if result and result[0] else 0
+    except:
+        return 0
+
+def load_scraper_capital_flow(code, days=3):
+    """读取资金流向数据"""
+    try:
+        conn = sqlite3.connect(SCRAPER_DB)
+        c = conn.cursor()
+        c.execute("""
+            SELECT main_net, retail_net FROM capital_flow 
+            WHERE code=? AND ts >= datetime('now', '-{} days')
+            ORDER BY ts DESC LIMIT 1
+        """.format(days), (code,))
+        result = c.fetchone()
+        conn.close()
+        if result:
+            return {"main_net": result[0], "retail_net": result[1]}
+        return None
+    except:
+        return None
+
+def load_scraper_sentiment(code, days=3):
+    """读取情绪数据"""
+    try:
+        conn = sqlite3.connect(SCRAPER_DB)
+        c = conn.cursor()
+        c.execute("""
+            SELECT positive_count, negative_count, comment_count FROM sentiment 
+            WHERE code=? AND ts >= datetime('now', '-{} days')
+            ORDER BY ts DESC LIMIT 1
+        """.format(days), (code,))
+        result = c.fetchone()
+        conn.close()
+        if result and result[2] > 0:
+            return {
+                "positive_ratio": result[0] / result[2],
+                "negative_ratio": result[1] / result[2],
+                "comment_count": result[2]
+            }
+        return None
+    except:
+        return None
+
+def load_scraper_sector_rank():
+    """读取板块热度排名（基于今日涨幅）"""
+    try:
+        conn = sqlite3.connect(SCRAPER_DB)
+        c = conn.cursor()
+        c.execute("""
+            SELECT name, change_pct FROM snapshots 
+            WHERE type='sector' AND ts >= date('now')
+            ORDER BY change_pct DESC
+        """)
+        results = c.fetchall()
+        conn.close()
+        return {r[0]: i+1 for i, r in enumerate(results)}
+    except:
+        return {}
+
 # ========== 日级别特征工程 ==========
 def build_features_daily(daily_returns, sector_returns, market_returns_list,
                          sector_vol_by_date=None, market_vol_by_date=None,
                          northbound_by_date=None, holding_daily_returns=None,
-                         lookback=5):
+                         sector="", code="", lookback=5):
     """
     生成日级别特征：
       - 基础：滞后收益 + 波动率 + 加速度
@@ -509,6 +584,43 @@ def build_features_daily(daily_returns, sector_returns, market_returns_list,
             feat["holding_ret_5d"] = 0
             feat["holding_vs_sector"] = 0
             feat["holding_vs_fund"] = 0
+
+        # ——— ✨✨✨ 爬虫数据特征（行业新闻 + 资金流向 + 情绪） ———
+        # 行业新闻评分（需要传入sector_name）
+        sector_name_map = {"power": "电力", "agri": "农业", "med": "医药", "mil": "军工", "coal": "煤炭"}
+        sector_name = sector_name_map.get(sector, sector)
+        news_score = load_scraper_news(sector_name, days=3)
+        feat["news_score_3d"] = news_score
+        news_score_7d = load_scraper_news(sector_name, days=7)
+        feat["news_score_7d"] = news_score_7d
+        feat["news_trend"] = news_score - news_score_7d  # 新闻情绪趋势
+        
+        # 资金流向（如果有数据）
+        capital = load_scraper_capital_flow(code, days=1)
+        if capital:
+            feat["capital_main_net"] = capital["main_net"] / 10000.0  # 归一化
+            feat["capital_retail_net"] = capital["retail_net"] / 10000.0
+            feat["capital_ratio"] = capital["main_net"] / (abs(capital["main_net"]) + abs(capital["retail_net"]) + 1)
+        else:
+            feat["capital_main_net"] = 0
+            feat["capital_retail_net"] = 0
+            feat["capital_ratio"] = 0
+        
+        # 散户情绪
+        sentiment = load_scraper_sentiment(code, days=1)
+        if sentiment:
+            feat["sentiment_positive"] = sentiment["positive_ratio"]
+            feat["sentiment_negative"] = sentiment["negative_ratio"]
+            feat["sentiment_count"] = min(sentiment["comment_count"] / 100.0, 1.0)  # 归一化
+        else:
+            feat["sentiment_positive"] = 0.5
+            feat["sentiment_negative"] = 0.5
+            feat["sentiment_count"] = 0
+        
+        # 板块热度排名
+        sector_rank = load_scraper_sector_rank()
+        rank = sector_rank.get(sector_name, 5)
+        feat["sector_rank"] = rank / 10.0  # 归一化（排名越小越好）
 
         features.append(feat)
         if i + 1 < n:
@@ -1465,6 +1577,8 @@ def close_learn():
             sector_vol_by_date=sector_vol_by_date,
             market_vol_by_date=market_vol_by_date,
             northbound_by_date=northbound_by_date,
+            sector=fund["sector"],
+            code=fc,
         )
 
         if not features or len(features) < 2:
@@ -1541,7 +1655,6 @@ def close_learn():
 
 
 # ========== 中午修正预测 ==========
-SCRAPER_DB = os.path.join(SCRIPT_DIR, "market_data.db")
 
 def fetch_fund_est(fund_code):
     """基金实时估值（盘中），用于中午模式回退"""
@@ -1887,6 +2000,8 @@ def main():
             market_vol_by_date=market_vol_by_date,
             northbound_by_date=northbound_by_date,
             holding_daily_returns=fund_holding_returns.get(fc),
+            sector=fund["sector"],
+            code=fc,
         )
         all_fund_data[fc] = {
             "features": features, "targets": targets,
