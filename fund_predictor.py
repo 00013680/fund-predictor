@@ -29,20 +29,33 @@ TRANSACTIONS = [
 
 # ========== 配置 ==========
 FUNDS = [
+    # ── 现有持仓 ──
     {"code": "021753", "name": "南方电力C", "sector": "power", "short": "电力"},
     {"code": "014064", "name": "银华农业C", "sector": "agri", "short": "农业"},
     {"code": "017938", "name": "易方达医疗C", "sector": "med", "short": "医疗"},
     {"code": "015468", "name": "嘉实农业C", "sector": "agri", "short": "农业2"},
     {"code": "008886", "name": "富国军工C", "sector": "mil", "short": "军工"},
     {"code": "013596", "name": "招商煤炭C", "sector": "coal", "short": "煤炭"},
+    # ── 新增 watchlist ──
+    {"code": "017175", "name": "天弘绿色电力C", "sector": "green_power", "short": "绿电"},
+    {"code": "012414", "name": "招商中证白酒C", "sector": "baijiu", "short": "白酒"},
+    {"code": "014674", "name": "富国港通互联网C", "sector": "hk_internet", "short": "港股互联"},
+    {"code": "008888", "name": "华夏半导体芯片C", "sector": "chip", "short": "半导体"},
+    {"code": "012651", "name": "博时半导体C", "sector": "chip", "short": "半导体2"},
+    {"code": "013014", "name": "华夏新能源车C", "sector": "new_energy", "short": "新能源车"},
 ]
 
 SECTORS = {
-    "power": {"name": "电力", "index": "sz399808"},
-    "agri":  {"name": "农业", "index": "sh000949"},
-    "med":   {"name": "医药", "index": "sz399989"},
-    "mil":   {"name": "军工", "index": "sz399959"},
-    "coal":  {"name": "煤炭", "index": "sz399998"},
+    "power":       {"name": "电力", "index": "sz399808"},
+    "agri":        {"name": "农业", "index": "sh000949"},
+    "med":         {"name": "医药", "index": "sz399989"},
+    "mil":         {"name": "军工", "index": "sz399959"},
+    "coal":        {"name": "煤炭", "index": "sz399998"},
+    "green_power": {"name": "绿色电力", "index": "sz399438"},
+    "baijiu":      {"name": "白酒", "index": "sz399997"},
+    "hk_internet": {"name": "港股互联", "index": "sh000001"},
+    "chip":        {"name": "半导体芯片", "index": "sz980017"},
+    "new_energy":  {"name": "新能源车", "index": "sz399976"},
 }
 MARKET_INDICES = {"上证指数": "sh000001", "创业板指": "sz399006"}
 
@@ -50,6 +63,10 @@ BEST_PARAMS = {
     "021753": (20, 0.01), "014064": (26, 0.01),
     "017938": (30, 0.01), "015468": (30, 1.00),
     "008886": (30, 0.01), "013596": (30, 0.01),
+    # 新增 watchlist 默认参数
+    "017175": (30, 0.01), "012414": (30, 0.01),
+    "014674": (30, 0.01), "008888": (30, 0.01),
+    "012651": (30, 0.01), "013014": (30, 0.01),
 }
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -139,7 +156,117 @@ def fetch_northbound_flow(days=500):
     except Exception:
         return {}
 
-# ========== 技术指标 ==========
+# ========== 基金持仓匹配（十大重仓股→加权个股行情） ==========
+HOLDINGS_CACHE_FILE = os.path.join(SCRIPT_DIR, "fund_holdings_cache.json")
+STOCK_CACHE_DIR = os.path.join(SCRIPT_DIR, "stock_cache")
+HOLDINGS_EXPIRE_DAYS = 7  # 持仓一周一更（季报实际更新频率更低）
+
+def stock_code_to_sina(code):
+    """股票代码转新浪格式"""
+    code = str(code).strip()
+    return f"sh{code}" if code.startswith("6") else f"sz{code}"
+
+def fetch_fund_holdings(fund_code, year=""):
+    """从天天基金获取基金季报十大重仓股列表"""
+    if not HAS_AKSHARE:
+        return []
+    url = f"https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code={fund_code}&topline=10000&year={year}&month=&rt=0.913877"
+    headers = {"Referer": "https://fundf10.eastmoney.com/", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=20) as resp:
+            text = resp.read().decode("utf-8")
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start < 0 or brace_end < 0:
+            return []
+        obj_str = text[brace_start:brace_end+1]
+        cpos = obj_str.find('content:"')
+        if cpos < 0:
+            return []
+        val_start = cpos + len('content:"')
+        last_brace = obj_str.rfind("}")
+        second_last = obj_str.rfind('"', 0, last_brace-1)
+        if second_last < val_start:
+            return []
+        content = obj_str[val_start:second_last]
+
+        # 解析HTML表格中的持仓数据
+        import re
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", content, re.DOTALL)
+        holdings = []
+        for row in rows:
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+            if len(cells) >= 4:
+                code_cell = re.sub(r"<[^>]+>", "", cells[1]).strip()
+                name_cell = re.sub(r"<[^>]+>", "", cells[2]).strip()
+                weight_pct = None
+                for cell in cells[3:]:
+                    cleaned = re.sub(r"<[^>]+>", "", cell).strip()
+                    if "%" in cleaned:
+                        try:
+                            weight_pct = float(cleaned.replace("%", "").strip())
+                        except:
+                            pass
+                        break
+                if code_cell and name_cell and weight_pct is not None:
+                    holdings.append({"code": code_cell, "name": name_cell, "weight": weight_pct})
+        return holdings
+    except Exception:
+        return []
+
+def load_cached_holdings():
+    """加载缓存的持仓数据"""
+    try:
+        with open(HOLDINGS_CACHE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_cached_holdings(data):
+    """保存持仓缓存"""
+    os.makedirs(os.path.dirname(HOLDINGS_CACHE_FILE), exist_ok=True)
+    with open(HOLDINGS_CACHE_FILE, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_all_holdings(fund_codes):
+    """批量获取并缓存所有基金的持仓
+    策略：先读缓存，7天外的重新拉取
+    """
+    cache = load_cached_holdings()
+    now_ts = time.time()
+    updated = False
+    for fc in fund_codes:
+        # 检查缓存是否过期
+        cached = cache.get(fc, {})
+        cached_ts = cached.get("fetch_time", 0)
+        if cached_ts > 0 and (now_ts - cached_ts) < HOLDINGS_EXPIRE_DAYS * 86400:
+            continue  # 缓存未过期
+        # 拉取最新持仓（尝试近3年）
+        holdings = []
+        for y in ["2026", "2025", "2024", "2023"]:
+            holdings = fetch_fund_holdings(fc, y)
+            if holdings:
+                break
+            time.sleep(0.2)
+        if holdings:
+            cache[fc] = {"holdings": holdings, "fetch_time": now_ts}
+            updated = True
+            print(f"    持仓 {fc}: {len(holdings)}只重仓股")
+        else:
+            print(f"    持仓 {fc}: 未拉到数据（用板块指数代替）")
+        time.sleep(0.3)
+    if updated:
+        save_cached_holdings(cache)
+    return cache
+
+def get_stock_daily_returns(stock_code, days=999):
+    """获取个股日收益率序列"""
+    symbol = stock_code_to_sina(stock_code)
+    data = fetch_sina_kline(symbol, days)
+    if not data:
+        return []
+    return calc_returns(data, "close")
 def calc_sma(prices, period):
     """简单移动平均"""
     sma = []
@@ -191,7 +318,8 @@ def calc_macd(returns, fast=12, slow=26, signal=9):
 # ========== 日级别特征工程 ==========
 def build_features_daily(daily_returns, sector_returns, market_returns_list,
                          sector_vol_by_date=None, market_vol_by_date=None,
-                         northbound_by_date=None, lookback=5):
+                         northbound_by_date=None, holding_daily_returns=None,
+                         lookback=5):
     """
     生成日级别特征：
       - 基础：滞后收益 + 波动率 + 加速度
@@ -348,9 +476,36 @@ def build_features_daily(daily_returns, sector_returns, market_returns_list,
         feat["poly_market_sector"] = feat["market_ret_1d"] * feat.get("sector_ret_1d", 0)
         feat["poly_vol_ret"] = feat.get("sector_vol_ratio", 1) * feat.get("sector_ret_1d", 0)
 
-        features.append(feat)
+        # ——— ✨✨✨ 持仓匹配（十大重仓股加权收益） ———
+        if holding_daily_returns:
+            if not hasattr(build_features_daily, "_hdr_cache") or build_features_daily._hdr_cache is not holding_daily_returns:
+                build_features_daily._hdr_cache = holding_daily_returns
+                build_features_daily._hdr_dict = {h["date"]: h for h in holding_daily_returns if h.get("date")}
+            hr_dict = build_features_daily._hdr_dict
+            hr = hr_dict.get(current_date, None)
+            if hr is not None:
+                feat["holding_ret_1d"] = hr.get("wtd_return", 0)
+                hr_5d = 0.0
+                for k in range(max(0, i-4), i+1):
+                    d = daily_returns[k]["date"]
+                    hr_item = hr_dict.get(d)
+                    if hr_item is not None:
+                        hr_5d += hr_item.get("wtd_return", 0)
+                feat["holding_ret_5d"] = hr_5d
+                feat["holding_vs_sector"] = feat["holding_ret_1d"] - feat.get("sector_ret_1d", 0)
+                feat["holding_vs_fund"] = feat["holding_ret_1d"] - fund_rets[i]
+            else:
+                feat["holding_ret_1d"] = 0
+                feat["holding_ret_5d"] = 0
+                feat["holding_vs_sector"] = 0
+                feat["holding_vs_fund"] = 0
+        else:
+            feat["holding_ret_1d"] = 0
+            feat["holding_ret_5d"] = 0
+            feat["holding_vs_sector"] = 0
+            feat["holding_vs_fund"] = 0
 
-        # ——— 目标：3日平均收益率（平滑噪声，提高信噪比） ———
+        features.append(feat)
         if i + 1 < n:
             if i + 3 < n:
                 target_val = sum(fund_rets[i+1:i+4]) / 3.0
@@ -1351,7 +1506,98 @@ def main():
     else:
         print("跳过")
 
-    # 3. 基金数据 + 日级别特征（含量能/VPT量价趋势/日历）
+    # 2.6 基金持仓匹配：十大重仓股→加权个股行情（静默模式，失败不阻塞）
+    print("  持仓匹配...")
+    holdings_cache = get_all_holdings([f["code"] for f in FUNDS])
+
+    # 收集所有唯一股票代码
+    all_stock_codes = set()
+    for fc, hc in holdings_cache.items():
+        for h in hc.get("holdings", []):
+            all_stock_codes.add(h["code"])
+    all_stock_codes.discard("")  # 去掉可能的空值
+
+    # 批量拉取个股日线数据（带10秒整体超时保护）
+    stock_returns = {}  # stock_code → [{"date": ..., "return": ...}, ...]
+    if all_stock_codes:
+        stock_kline_dir = os.path.join(SCRIPT_DIR, "stock_cache")
+        os.makedirs(stock_kline_dir, exist_ok=True)
+        fetched = 0
+        for sc in sorted(all_stock_codes):
+            # 个股日行情缓存文件（按股票代码单独存，避免大文件）
+            cache_path = os.path.join(stock_kline_dir, f"{sc}.json")
+            stock_data = None
+            try:
+                with open(cache_path, "r") as f:
+                    cached = json.load(f)
+                # 当天缓存有效
+                if cached.get("date") == datetime.now().strftime("%Y-%m-%d"):
+                    stock_data = cached["data"]
+            except:
+                pass
+            if stock_data is None:
+                stock_data = get_stock_daily_returns(sc, 999)
+                if stock_data:
+                    try:
+                        with open(cache_path, "w") as f:
+                            json.dump({"date": datetime.now().strftime("%Y-%m-%d"), "data": stock_data}, f)
+                    except:
+                        pass
+                    time.sleep(0.15)
+                    fetched += 1
+            if stock_data:
+                stock_returns[sc] = stock_data
+        print(f"    个股行情: {len(stock_returns)}/{len(all_stock_codes)}只股票 ({fetched}新拉取)")
+    else:
+        print("    无持仓数据，跳过")
+
+    # 计算每只基金的加权持仓收益率
+    fund_holding_returns = {}  # fund_code → [{"date":..., "wtd_return":...}, ...]
+    for fc in [f["code"] for f in FUNDS]:
+        hc = holdings_cache.get(fc, {})
+        holdings_list = hc.get("holdings", [])
+        if not holdings_list or not stock_returns:
+            fund_holding_returns[fc] = None
+            continue
+
+        # 计算每日加权收益率
+        total_weight = sum(h["weight"] for h in holdings_list)
+        if total_weight <= 0:
+            fund_holding_returns[fc] = None
+            continue
+
+        # 找出所有股票中最短的日收益率序列长度
+        seq_lens = []
+        stock_rets = {}
+        for h in holdings_list:
+            rets = stock_returns.get(h["code"])
+            if rets and len(rets) > 10:
+                stock_rets[h["code"]] = rets
+                seq_lens.append(len(rets))
+        if not stock_rets:
+            fund_holding_returns[fc] = None
+            continue
+        min_len = min(seq_lens)
+        # 统一截取到最短序列
+        wtd_returns = []
+        for idx in range(min_len):
+            wtd = 0.0
+            wsum = 0.0
+            di = None
+            for h in holdings_list:
+                rets = stock_rets.get(h["code"])
+                if rets and idx < len(rets):
+                    w = h["weight"]
+                    wtd += w * rets[idx]["return"]
+                    wsum += w
+                    if di is None:
+                        di = rets[idx]["date"]
+            if wsum > 0 and di:
+                wtd_returns.append({"date": di, "wtd_return": wtd / wsum})
+        fund_holding_returns[fc] = wtd_returns
+        print(f"    持仓加权收益率 {fc}: {len(wtd_returns)}天")
+
+    # 3. 基金数据 + 日级别特征（含量能/VPT量价趋势/日历/持仓匹配）
     all_fund_data = {}
     for fund in FUNDS:
         fc = fund["code"]
@@ -1376,6 +1622,7 @@ def main():
             sector_vol_by_date=sector_vol_by_date,
             market_vol_by_date=market_vol_by_date,
             northbound_by_date=northbound_by_date,
+            holding_daily_returns=fund_holding_returns.get(fc),
         )
         all_fund_data[fc] = {
             "features": features, "targets": targets,
