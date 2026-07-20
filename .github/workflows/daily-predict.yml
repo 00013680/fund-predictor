@@ -2,9 +2,21 @@ name: Daily Fund Prediction
 
 on:
   schedule:
-    # 每天北京时间 9:30 (UTC 1:30)
+    # 每天北京时间 9:30 (UTC 1:30) - 早上完整预测
     - cron: '30 1 * * *'
+    # 每天北京时间 11:35 (UTC 3:35) - 中午修正预测
+    - cron: '35 3 * * *'
   workflow_dispatch:  # 允许手动触发
+    inputs:
+      mode:
+        description: '运行模式'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - morning
+          - noon
 
 permissions:
   contents: write
@@ -24,7 +36,20 @@ jobs:
       - name: Run fund predictor
         run: |
           mkdir -p output
-          python fund_predictor.py
+          MODE="${{ github.event.inputs.mode }}"
+          if [ "$MODE" = "noon" ]; then
+            python fund_predictor.py --noon
+          elif [ "$MODE" = "morning" ]; then
+            python fund_predictor.py
+          else
+            # auto: 根据UTC时间判断
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" = "03" ]; then
+              python fund_predictor.py --noon
+            else
+              python fund_predictor.py
+            fi
+          fi
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4

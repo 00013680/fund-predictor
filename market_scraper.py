@@ -321,6 +321,22 @@ def get_latest_summary():
     conn.close()
     return result
 
+# ========== 数据清理 ==========
+def cleanup_old_data(conn, keep_days=30):
+    """清理超过keep_days天的旧数据，防止数据库无限增长"""
+    cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d %H:%M:%S")
+    c = conn.cursor()
+    c.execute("DELETE FROM snapshots WHERE ts < ?", (cutoff,))
+    deleted_snap = c.rowcount
+    c.execute("DELETE FROM news WHERE ts < ?", (cutoff,))
+    deleted_news = c.rowcount
+    conn.commit()
+    if deleted_snap or deleted_news:
+        log(f"  清理: 删{deleted_snap}条快照, {deleted_news}条新闻 (保留{keep_days}天)")
+    # 压缩数据库
+    conn.execute("VACUUM")
+    conn.commit()
+
 # ========== 入口 ==========
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "auto"
@@ -334,6 +350,9 @@ if __name__ == "__main__":
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif mode == "auto":
         # 自动判断：盘中抓实时，收盘后抓净值
+        conn = init_db()
+        cleanup_old_data(conn)
+        conn.close()
         if is_trading_hours():
             run_realtime_scrape()
         elif is_after_close():

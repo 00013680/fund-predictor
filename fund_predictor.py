@@ -10,7 +10,7 @@
 6. 精美HTML仪表盘
 """
 
-import json, math, os, sys, time
+import json, math, os, sqlite3, sys, time
 from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
 
@@ -109,6 +109,36 @@ def calc_returns(data, key="nav"):
     return [{"date": data[i]["date"], "return": (data[i][key]-data[i-1][key])/data[i-1][key], "value": data[i][key]}
             for i in range(1, len(data)) if data[i-1][key] > 0]
 
+# ========== 北向资金（akshare封装，失败则静默跳过） ==========
+HAS_AKSHARE = False
+try:
+    os.environ["TQDM_DISABLE"] = "1"  # 关掉akshare的进度条
+    import akshare as ak
+    HAS_AKSHARE = True
+except ImportError:
+    pass
+
+def fetch_northbound_flow(days=500):
+    """获取北向资金历史日度净流入（沪+深合计），失败返回空字典"""
+    if not HAS_AKSHARE:
+        return {}
+    try:
+        sh = ak.stock_hsgt_hist_em(symbol="沪股通")
+        sz = ak.stock_hsgt_hist_em(symbol="深股通")
+        result = {}
+        for df, label in [(sh, "sh"), (sz, "sz")]:
+            for _, row in df.iterrows():
+                d = row["日期"]
+                val = row.get("当日成交净买额", None)
+                if val is None or (isinstance(val, float) and math.isnan(val)):
+                    continue
+                if d not in result:
+                    result[d] = 0.0
+                result[d] += val  # 沪+深=北向合计净流入（亿元）
+        return result
+    except Exception:
+        return {}
+
 # ========== 技术指标 ==========
 def calc_sma(prices, period):
     """简单移动平均"""
@@ -160,12 +190,14 @@ def calc_macd(returns, fast=12, slow=26, signal=9):
 
 # ========== 日级别特征工程 ==========
 def build_features_daily(daily_returns, sector_returns, market_returns_list,
-                         sector_vol_by_date=None, market_vol_by_date=None, lookback=5):
+                         sector_vol_by_date=None, market_vol_by_date=None,
+                         northbound_by_date=None, lookback=5):
     """
     生成日级别特征：
       - 基础：滞后收益 + 波动率 + 加速度
       - 技术：RSI + MACD + 均线乖离
-      - 量能：板块/大盘成交量比 + 量价趋势
+      - 量能：板块/大盘成交量比 + VPT量价趋势
+      - 资金流向：北向资金净流入 + 板块VPT
       - 日历：星期效应 + 月初月末 + 季末
     """
     fund_rets = [r["return"] for r in daily_returns]
@@ -275,6 +307,25 @@ def build_features_daily(daily_returns, sector_returns, market_returns_list,
         else:
             feat["market_vol_ratio"] = 1.0
 
+        # ——— ✨✨ 北向资金 + VPT量价趋势（资金流向代理） ———
+        # 北向资金（真实数据，最近几天可能NaN/缺失）
+        nb = 0.0
+        if northbound_by_date and current_date in northbound_by_date:
+            nb = northbound_by_date[current_date]
+        feat["northbound_net"] = nb / 100.0
+        # 北向5日累计
+        nb_5d = 0.0
+        if northbound_by_date:
+            for k in range(max(0, i-4), i+1):
+                d = daily_returns[k]["date"]
+                nb_5d += northbound_by_date.get(d, 0)
+        feat["northbound_5d"] = nb_5d / 100.0
+
+        # VPT量价趋势（补充信号）
+        feat["sector_vpt"] = feat.get("sector_vol_ratio", 1.0) * feat.get("sector_ret_1d", 0)
+        feat["market_vpt"] = feat.get("market_vol_ratio", 1.0) * feat["market_ret_1d"]
+        feat["vpt_divergence"] = abs(feat["sector_vpt"] - feat["market_vpt"])
+
         # ——— ✨ 日历效应 ———
         dt = datetime.strptime(current_date, "%Y-%m-%d")
         wd = dt.weekday()
@@ -356,7 +407,7 @@ class RidgeModel:
             self.bias -= lr_adj * gb
         self.trained = True
 
-    def partial_fit(self, X, y, n_epochs=3):
+    def partial_fit(self, X, y, n_epochs=5):
         """在线更新：用新数据做少量梯度下降步，保留原有标准化参数"""
         if not self.trained or not X or len(X) < 1:
             return self.fit(X, y)
@@ -433,7 +484,7 @@ def predict_daily(all_fund_data, fund_code, sector, model_dir):
 
     # ── 个体模型（在线学习） ──
     indiv_path = os.path.join(model_dir, f"{fund_code}_indiv.json")
-    indiv = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=3)
+    indiv = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=5)
     last_date = load_model_state(indiv, indiv_path)
 
     if not last_date or not indiv.trained:
@@ -458,7 +509,7 @@ def predict_daily(all_fund_data, fund_code, sector, model_dir):
             if fund_tgts[j] is not None and fund_tgts[j]["date"] > last_date:
                 new_X.append(fund_feats[j]); new_y.append(fund_tgts[j]["return"])
         if new_X:
-            indiv.partial_fit(new_X, new_y, n_epochs=3)
+            indiv.partial_fit(new_X, new_y, n_epochs=5)
             print(f"    {fund_code} 在线学习: +{len(new_X)}条 [{new_X[0]['date']} → {new_X[-1]['date']}]")
         new_last_date = fund_tgts[n-2]["date"] if n >= 2 else ""
         if not new_last_date:
@@ -467,80 +518,11 @@ def predict_daily(all_fund_data, fund_code, sector, model_dir):
     # 保存更新后的模型
     save_model_state(indiv, indiv_path, new_last_date)
 
-    # ── 全局模型（滑动窗口250天） ──
-    MAX_HISTORY = 250
-    gx, gy = [], []
-    for fc, fd in all_fund_data.items():
-        nf = len(fd["features"])
-        start = max(0, nf - MAX_HISTORY - 1)
-        for j in range(start, nf - 1):
-            if fd["targets"][j] is not None:
-                gx.append(fd["features"][j]); gy.append(fd["targets"][j]["return"])
-    gm = RidgeModel(alpha=alpha, lr=0.01, n_epochs=200)
-    if len(gx) >= 10: gm.fit(gx, gy)
-    g_pred = gm.predict(last_feat)
-
-    # ── 板块模型（滑动窗口250天） ──
-    sx, sy = [], []
-    for sf in [f for f in FUNDS if f["sector"] == sector]:
-        if sf["code"] in all_fund_data:
-            fd = all_fund_data[sf["code"]]
-            nf = len(fd["features"])
-            start = max(0, nf - MAX_HISTORY - 1)
-            for j in range(start, nf - 1):
-                if fd["targets"][j] is not None:
-                    sx.append(fd["features"][j]); sy.append(fd["targets"][j]["return"])
-    sm = RidgeModel(alpha=alpha, lr=0.01, n_epochs=200)
-    if len(sx) >= 5: sm.fit(sx, sy)
-    s_pred = sm.predict(last_feat)
-
-    # ── 个体预测 ──
+    # ── 只用个体模型（三层集成已验证不如单层） ──
     i_pred = indiv.predict(last_feat)
+    final = i_pred
 
-    # ── 性能加权集成（近60天个体模型方向准确率 → 动态调权） ──
-    ni = len(indiv.feature_names) if indiv.feature_names else 1
-    ns, ng = len(sx), len(gx)
-    total_dc = ni + ns + ng
-    w_g_dc = ng / total_dc if total_dc > 0 else 1/3
-    w_s_dc = ns / total_dc if total_dc > 0 else 1/3
-    w_i_dc = ni / total_dc if total_dc > 0 else 1/3
-
-    # 检查个体模型近期准确率
-    perf_window = min(60, n - 1)
-    if perf_window >= 15 and indiv.trained:
-        i_correct = 0; i_total = 0
-        for t in range(max(0, n - perf_window - 1), n - 1):
-            if fund_tgts[t] is None: continue
-            pv = indiv.predict(fund_feats[t])
-            av = fund_tgts[t]["return"]
-            if (pv > 0 and av > 0) or (pv < 0 and av < 0):
-                i_correct += 1
-            i_total += 1
-        i_acc = i_correct / max(i_total, 1)
-
-        # 根据准确率调整权重
-        if i_acc < 0.35 and i_total >= 10:
-            # 严重差 → 大幅压低个体权重
-            penalty = 0.6
-            w_i = w_i_dc * (1 - penalty)
-            shift = w_i_dc * penalty
-            w_g = w_g_dc + shift * 0.6
-            w_s = w_s_dc + shift * 0.4
-        elif i_acc < 0.45 and i_total >= 10:
-            # 较差 → 适度压低
-            penalty = 0.3
-            w_i = w_i_dc * (1 - penalty)
-            shift = w_i_dc * penalty
-            w_g = w_g_dc + shift * 0.6
-            w_s = w_s_dc + shift * 0.4
-        else:
-            w_i, w_g, w_s = w_i_dc, w_g_dc, w_s_dc
-    else:
-        w_i, w_g, w_s = w_i_dc, w_g_dc, w_s_dc
-
-    final = w_g * g_pred + w_s * s_pred + w_i * i_pred
-
-    return final, g_pred, s_pred, i_pred
+    return final, final, final, final
 
 # ========== 日级别交易策略 ==========
 def generate_daily_advice(fund_data, daily_prediction, today):
@@ -552,12 +534,12 @@ def generate_daily_advice(fund_data, daily_prediction, today):
     today_change = (daily[-1]["nav"] - daily[-2]["nav"]) / daily[-2]["nav"] * 100
     pred_pct = daily_prediction * 100
 
-    if pred_pct > 0.3:
+    if pred_pct > 0.15:
         if today_change < -0.5:
             action, reason = "加仓", f"预测明日+{pred_pct:.2f}%，今日回调{today_change:+.1f}%，可逢低布局"
         else:
             action, reason = "买入", f"预测明日上涨{pred_pct:.2f}%，可适当加仓"
-    elif pred_pct < -0.3:
+    elif pred_pct < -0.15:
         if today_change > 0.5:
             action, reason = "减持", f"预测明日下跌{pred_pct:.2f}%，今日反弹{today_change:+.1f}%可减仓"
         else:
@@ -623,12 +605,113 @@ def calc_accuracy_daily(fund_code, sector, all_fund_data):
         sq_err_sum += (pred - actual) ** 2
         total += 1
         # 在线更新：预测完立即学
-        model.partial_fit([ff[wi]], [actual], n_epochs=3)
+        model.partial_fit([ff[wi]], [actual], n_epochs=5)
 
     rmse = math.sqrt(sq_err_sum / total) if total > 0 else 0
     if rmse > 0.001:
         print(f"    {fund_code} RMSE={rmse:.4f} 方向准确率={correct}/{total}")
     return round(correct/total*100, 1) if total > 0 else 0
+
+def calc_accuracy_ensemble(fund_code, sector, all_fund_data):
+    """在线回测三层集成准确率（个体在线学习 + 全局/板块XGBoost静态评估）"""
+    params = BEST_PARAMS.get(fund_code, (36, 0.1))
+    alpha = params[1]
+    ff = all_fund_data[fund_code]["features"]
+    ft = all_fund_data[fund_code]["targets"]
+    n = len(ff)
+    if n < 80: return 0, 0
+
+    test_start = max(60, n - 60)
+
+    # ── 全局模型（训练集上训练一次） ──
+    MAX_HISTORY = 250
+    gx, gy = [], []
+    for fc, fd in all_fund_data.items():
+        nf = len(fd["targets"])
+        if nf < 5: continue
+        start = max(0, nf - MAX_HISTORY - 1)
+        for j in range(start, min(test_start, nf)):
+            if fd["targets"][j] is not None:
+                gx.append(fd["features"][j]); gy.append(fd["targets"][j]["return"])
+    gm = RidgeModel(alpha=alpha, lr=0.01, n_epochs=200)
+    if len(gx) >= 10: gm.fit(gx, gy)
+
+    # ── 板块模型 ──
+    sx, sy = [], []
+    for sf in [f for f in FUNDS if f["sector"] == sector]:
+        if sf["code"] in all_fund_data:
+            fd = all_fund_data[sf["code"]]
+            nf = len(fd["targets"])
+            if nf < 5: continue
+            start = max(0, nf - MAX_HISTORY - 1)
+            for j in range(start, min(test_start, nf)):
+                if fd["targets"][j] is not None:
+                    sx.append(fd["features"][j]); sy.append(fd["targets"][j]["return"])
+    sm = RidgeModel(alpha=alpha, lr=0.01, n_epochs=200)
+    if len(sx) >= 5: sm.fit(sx, sy)
+
+    # ── 个体模型在线学习回测 ──
+    model = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=500)
+    train_X = ff[:test_start]
+    train_y = [t["return"] for t in ft[:test_start] if t is not None]
+    if len(train_X) >= 30:
+        model.fit(train_X, train_y)
+    else:
+        return 0, 0
+
+    correct_indiv = 0; correct_ens = 0; total = 0
+
+    for wi in range(test_start, n - 1):
+        if ft[wi] is None: continue
+        actual = ft[wi]["return"]
+
+        i_pred = model.predict(ff[wi])
+        g_pred = gm.predict(ff[wi]) if gm.trained else 0
+        s_pred = sm.predict(ff[wi]) if sm.trained else 0
+
+        ng, ns, ni = len(gx), len(sx), len(model.feature_names) if model.feature_names else 1
+        total_dc = ng + ns + ni
+        w_g = ng / total_dc if total_dc > 0 else 1/3
+        w_s = ns / total_dc if total_dc > 0 else 1/3
+        w_i = ni / total_dc if total_dc > 0 else 1/3
+
+        # 个体近期准确率调权
+        perf_window = min(60, wi - test_start)
+        if perf_window >= 15 and model.trained:
+            ic = 0; it = 0
+            for t in range(max(test_start, wi - perf_window), wi):
+                if ft[t] is None: continue
+                pv = model.predict(ff[t])
+                av = ft[t]["return"]
+                if (pv > 0 and av > 0) or (pv < 0 and av < 0):
+                    ic += 1
+                it += 1
+            i_acc = ic / max(it, 1)
+            if i_acc < 0.35 and it >= 10:
+                pen = 0.6
+                shift = w_i * pen
+                w_i *= (1 - pen)
+                w_g += shift * 0.6; w_s += shift * 0.4
+            elif i_acc < 0.45 and it >= 10:
+                pen = 0.3
+                shift = w_i * pen
+                w_i *= (1 - pen)
+                w_g += shift * 0.6; w_s += shift * 0.4
+
+        ens_pred = w_g * g_pred + w_s * s_pred + w_i * i_pred
+        total += 1
+
+        if (ens_pred > 0 and actual > 0) or (ens_pred < 0 and actual < 0):
+            correct_ens += 1
+        if (i_pred > 0 and actual > 0) or (i_pred < 0 and actual < 0):
+            correct_indiv += 1
+
+        model.partial_fit([ff[wi]], [actual], n_epochs=5)
+
+    acc_ens = round(correct_ens/total*100, 1) if total > 0 else 0
+    acc_indiv = round(correct_indiv/total*100, 1) if total > 0 else 0
+    print(f"    {fund_code} 🔗 集成={correct_ens}/{total}({acc_ens}%) | 个体={correct_indiv}/{total}({acc_indiv}%)")
+    return acc_ens, acc_indiv
 
 # ========== HTML生成 ==========
 def generate_html(results, update_time):
@@ -651,7 +734,7 @@ def generate_html(results, update_time):
     for r in results:
         pred_pct = r["final_pred"] * 100
         pred_color = "#e74c3c" if pred_pct < 0 else "#27ae60"
-        pred_arrow = "📈" if pred_pct > 0.3 else ("📉" if pred_pct < -0.3 else "➡️")
+        pred_arrow = "📈" if pred_pct > 0.15 else ("📉" if pred_pct < -0.15 else "➡️")
         advice = r.get("advice", {})
         action = advice.get("action", "—")
         reason = advice.get("reason", "")
@@ -748,10 +831,8 @@ def generate_html(results, update_time):
             <div class="dc-chart"><canvas id="ch{idx}"></canvas></div>
             <div class="dc-reason">{reason}</div>
             <div class="dc-layers">
-                <span>全局 {r['global_pred']*100:+.2f}%</span>
-                <span>板块 {r['sector_pred']*100:+.2f}%</span>
-                <span>个体 {r['individual_pred']*100:+.2f}%</span>
-                <span style="color:#888">在线校准 ✓</span>
+                <span>个体模型 {r['individual_pred']*100:+.2f}%</span>
+                <span style="color:#888">个体在线校准 ✓ | 北向资金 ✓ | 3日平滑 ✓</span>
             </div>
         </div>"""
 
@@ -1040,6 +1121,185 @@ document.addEventListener('DOMContentLoaded', function() {{
     return html
 
 
+# ========== 中午修正预测 ==========
+SCRAPER_DB = os.path.join(SCRIPT_DIR, "market_data.db")
+
+def fetch_fund_est(fund_code):
+    """基金实时估值（盘中），用于中午模式回退"""
+    url = f"https://fundgz.1234567.com.cn/js/{fund_code}.js"
+    headers = {"Referer": "https://fundf10.eastmoney.com/", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=15) as resp:
+            text = resp.read().decode("utf-8")
+        import re
+        match = re.search(r'jsonpgz\((.+)\)', text)
+        if not match:
+            return None
+        data = json.loads(match.group(1))
+        return {
+            "name": data.get("name", ""),
+            "nav": float(data.get("gsz", 0)),
+            "change_pct": float(data.get("gszzl", 0)),
+            "time": data.get("gztime", ""),
+        }
+    except Exception:
+        return None
+
+def read_today_scraper_data():
+    """读取爬虫今天存的盘中数据"""
+    if not os.path.exists(SCRAPER_DB):
+        return {}
+    conn = sqlite3.connect(SCRAPER_DB)
+    c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    result = {"funds": {}, "indices": {}, "sectors": {}}
+    c.execute("SELECT code, name, price, change_pct, ts FROM snapshots WHERE type='fund_est' AND ts LIKE ? ORDER BY ts DESC", (f"{today}%",))
+    rows = c.fetchall()
+    seen = set()
+    for code, name, price, change_pct, ts in rows:
+        if code not in seen:
+            result["funds"][code] = {"name": name, "est_nav": price, "est_change": change_pct, "ts": ts}
+            seen.add(code)
+    c.execute("SELECT code, name, price, change_pct, ts FROM snapshots WHERE type='index' AND ts LIKE ? ORDER BY ts DESC", (f"{today}%",))
+    rows = c.fetchall()
+    seen = set()
+    for code, name, price, change_pct, ts in rows:
+        if code not in seen:
+            result["indices"][name] = {"price": price, "change_pct": change_pct, "ts": ts}
+            seen.add(code)
+    c.execute("SELECT code, name, price, change_pct, ts FROM snapshots WHERE type='sector' AND ts LIKE ? ORDER BY ts DESC", (f"{today}%",))
+    rows = c.fetchall()
+    seen = set()
+    for code, name, price, change_pct, ts in rows:
+        if code not in seen:
+            result["sectors"][name] = {"price": price, "change_pct": change_pct, "ts": ts}
+            seen.add(code)
+    conn.close()
+    return result
+
+def load_morning_prediction():
+    """读取今天早上的预测"""
+    data = load_predictions()
+    today = datetime.now().strftime("%Y-%m-%d")
+    for pred in reversed(data.get("predictions", [])):
+        if pred.get("date") == today and pred.get("type") == "daily":
+            return pred
+    return None
+
+def noon_predict():
+    """中午修正预测：对比早盘实际走势，修正预测"""
+    now = datetime.now()
+    print(f"[{now.strftime('%Y-%m-%d %H:%M')}] 基金预测 v6 — 中午修正")
+
+    morning = load_morning_prediction()
+    if not morning:
+        print("  ⚠️ 今天没有早上预测记录")
+        return
+
+    scraper_data = read_today_scraper_data()
+    funds_est = scraper_data.get("funds", {})
+    indices = scraper_data.get("indices", {})
+    sectors = scraper_data.get("sectors", {})
+
+    if not funds_est and not indices:
+        print("  ⚠️ 爬虫数据为空（market_data.db里今天没有数据）")
+        print("  回退到API直接获取...")
+        for fund in FUNDS:
+            est = fetch_fund_est(fund["code"])
+            if est:
+                funds_est[fund["code"]] = {"name": fund["name"], "est_nav": est["nav"], "est_change": est["change_pct"], "ts": est.get("time", "")}
+
+    # === 早盘总结 ===
+    print("\n" + "=" * 55)
+    print("  📊 早盘总结")
+    print("=" * 55)
+
+    print("\n  大盘指数:")
+    for name, data in indices.items():
+        pct = data["change_pct"]
+        icon = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+        print(f"    {icon} {name}: {data['price']:.2f} ({pct:+.2f}%)")
+
+    print("\n  板块:")
+    for name, data in sectors.items():
+        pct = data["change_pct"]
+        icon = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+        print(f"    {icon} {name}: {pct:+.2f}%")
+
+    # === 对比修正 ===
+    print("\n" + "=" * 55)
+    print("  🔍 早盘对比 & 修正")
+    print("=" * 55)
+
+    morning_funds = morning.get("funds", {})
+    results = []
+
+    print(f"\n  {'基金':<14} {'早预测':>8} {'今实际':>8} {'偏差':>8} {'状态':<6}")
+    print(f"  {'─'*14} {'─'*8} {'─'*8} {'─'*8} {'─'*6}")
+
+    for code, mpred in morning_funds.items():
+        name = mpred.get("name", code)
+        morning_pct = mpred.get("predicted", 0)
+        actual = 0.0
+        if code in funds_est:
+            actual = funds_est[code].get("est_change", 0.0)
+
+        deviation = actual - morning_pct
+        direction_correct = (morning_pct > 0 and actual > 0) or (morning_pct < 0 and actual < 0) or (abs(morning_pct) < 0.05 and abs(actual) < 0.1)
+        status = "✓" if direction_correct else "✗"
+
+        if abs(deviation) > 1.0:
+            adjust = "⚠️大幅偏离"
+        elif abs(deviation) > 0.3:
+            adjust = "🔄需修正"
+        else:
+            adjust = "✅一致"
+
+        print(f"  {name:<12} {morning_pct:>+7.2f}% {actual:>+7.2f}% {deviation:>+7.2f}% {status} {adjust}")
+
+        revised = morning_pct * 0.4 + actual * 0.6 if abs(deviation) > 0.3 else morning_pct
+        results.append({
+            "code": code, "name": name,
+            "morning_pred": morning_pct, "actual_today": round(actual, 3),
+            "deviation": round(deviation, 3), "revised": round(revised, 3),
+            "direction_ok": direction_correct,
+        })
+
+    # === 明日修正预测 ===
+    print(f"\n  {'基金':<14} {'早预测':>8} {'修正后':>8} {'变化':>8}")
+    print(f"  {'─'*14} {'─'*8} {'─'*8} {'─'*8}")
+
+    noon_record = {"date": now.strftime("%Y-%m-%d"), "type": "noon", "funds": {}}
+
+    for r in results:
+        change = r["revised"] - r["morning_pred"]
+        icon = "📈" if change > 0.05 else ("📉" if change < -0.05 else "➡️")
+        print(f"  {r['name']:<12} {r['morning_pred']:>+7.2f}% {r['revised']:>+7.2f}% {change:>+7.2f}% {icon}")
+        noon_record["funds"][r["code"]] = {"predicted": r["revised"], "name": r["name"]}
+
+    # 保存修正记录
+    save_daily_prediction(noon_record)
+    print("\n  📝 已保存中午修正记录")
+
+    # 综合建议
+    print("\n" + "=" * 55)
+    print("  💡 下午操作建议")
+    print("=" * 55)
+
+    for r in results:
+        act = "持有观望"
+        if r["revised"] > 0.15 and not r["direction_ok"]:
+            act = "考虑减仓（走势偏离预测）"
+        elif r["revised"] > 0.15 and r["direction_ok"]:
+            act = "继续持有"
+        elif r["revised"] < -0.15 and r["actual_today"] < -1.0:
+            act = "考虑止损（跌幅加大）"
+        elif r["revised"] < -0.15:
+            act = "暂不加仓，等明日"
+        print(f"    {r['name']}: {act}")
+
+
 # ========== 主程序 ==========
 def main():
     now = datetime.now()
@@ -1081,7 +1341,17 @@ def main():
         time.sleep(0.2)
     print("OK")
 
-    # 3. 基金数据 + 日级别特征（含量能/日历）
+    # 2.5 北向资金历史数据
+    print("  北向资金...", end=" ")
+    northbound_by_date = fetch_northbound_flow()
+    nb_days = len(northbound_by_date)
+    if nb_days > 0:
+        nb_sorted = sorted(northbound_by_date.keys())
+        print(f"{nb_days}天 [{nb_sorted[0]} → {nb_sorted[-1]}]")
+    else:
+        print("跳过")
+
+    # 3. 基金数据 + 日级别特征（含量能/VPT量价趋势/日历）
     all_fund_data = {}
     for fund in FUNDS:
         fc = fund["code"]
@@ -1105,6 +1375,7 @@ def main():
             market_daily,
             sector_vol_by_date=sector_vol_by_date,
             market_vol_by_date=market_vol_by_date,
+            northbound_by_date=northbound_by_date,
         )
         all_fund_data[fc] = {
             "features": features, "targets": targets,
@@ -1123,13 +1394,14 @@ def main():
 
         final, g, s, i = predict_daily(all_fund_data, fc, fund["sector"], MODEL_DIR)
         accuracy = calc_accuracy_daily(fc, fund["sector"], all_fund_data)
+        acc_ens, acc_indiv = calc_accuracy_ensemble(fc, fund["sector"], all_fund_data)
         advice = generate_daily_advice(fd, final, now)
 
         results.append({
             "code": fc, "name": fund["name"], "sector": fund["sector"],
             "history": fd["daily"],
             "final_pred": final, "global_pred": g, "sector_pred": s, "individual_pred": i,
-            "accuracy": accuracy, "advice": advice,
+            "accuracy": acc_ens, "accuracy_indiv": acc_indiv, "advice": advice,
         })
 
         pct = final * 100
@@ -1165,4 +1437,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--noon" in sys.argv:
+        noon_predict()
+    else:
+        main()
