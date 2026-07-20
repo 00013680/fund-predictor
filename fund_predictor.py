@@ -969,6 +969,13 @@ def generate_html(results, update_time):
         action_icon = {"加仓": "🟢", "买入": "🟢", "减持": "🔴", "减仓": "🔴", "持有": "🔵", "观望": "⚪"}.get(action, "⚪")
         today_color = "#e74c3c" if today_chg < 0 else "#27ae60"
         acc_color = "#27ae60" if accuracy >= 55 else ("#e67e22" if accuracy >= 50 else "#e74c3c")
+        pnl = r.get("pnl")
+        pnl_pct = r.get("pnl_pct")
+        if pnl is not None and pnl_pct is not None:
+            pnl_cls = "pnl-pos" if pnl >= 0 else "pnl-neg"
+            pnl_html = f'<span class="{pnl_cls}">{pnl:+.0f}元 ({pnl_pct:+.1f}%)</span>'
+        else:
+            pnl_html = '<span style="color:#999">—</span>'
 
         table_rows += f"""
         <tr>
@@ -977,6 +984,7 @@ def generate_html(results, update_time):
             <td style="color:{today_color};font-weight:600">{today_chg:+.2f}%</td>
             <td style="color:{pred_color};font-weight:600">{pred_arrow} {pred_pct:+.2f}%</td>
             <td style="color:{acc_color}">{accuracy}%</td>
+            <td>{pnl_html}</td>
             <td style="color:{action_color};font-weight:700">{action_icon} {action}</td>
             <td class="reason-cell">{reason}</td>
         </tr>"""
@@ -1036,15 +1044,26 @@ def generate_html(results, update_time):
                 pc = "#e74c3c" if pct < 0 else "#27ae60"
                 perf_html += f'<span class="perf-tag" style="color:{pc}">{label} {pct:+.2f}%</span>'
 
+        # 我的盈亏
+        pnl = r.get("pnl")
+        pnl_pct = r.get("pnl_pct")
+        cost = r.get("cost")
+        if pnl is not None:
+            pnl_c = "#e74c3c" if pnl >= 0 else "#27ae60"
+            pnl_html_card = f'<div style="font-size:13px;padding:4px 10px;color:{pnl_c}">💰 我的盈亏: {pnl:+.0f}元 ({pnl_pct:+.1f}%) · 投入{cost:.0f}元</div>'
+        else:
+            pnl_html_card = ""
+
         detail_cards += f"""
         <div class="detail-card">
             <div class="dc-header">
                 <span class="dc-name" style="border-left:4px solid {c}">{r['name']}</span>
                 <span class="dc-nav">最新 {all_navs[-1]:.4f}</span>
-                <span class="dc-pred" style="color:{'#e74c3c' if pred_pct<0 else '#27ae60'}">明日 {pred_pct:+.2f}%</span>
+                <span class="dc-pred tip" data-tip="未来3个交易日的平均收益率" style="color:{'#e74c3c' if pred_pct<0 else '#27ae60'}">3日趋势 {pred_pct:+.2f}%</span>
                 <span class="dc-action" style="color:{action_color};background:{action_color}15;padding:2px 10px;border-radius:12px;font-weight:600">{action}</span>
             </div>
             <div class="dc-perf">{perf_html}</div>
+            {pnl_html_card}
             <div class="dc-periods">
                 <button class="period-btn" data-idx="{idx}" data-days="5" onclick="switchPeriod(this)">近1周</button>
                 <button class="period-btn" data-idx="{idx}" data-days="22" onclick="switchPeriod(this)">近1月</button>
@@ -1698,7 +1717,15 @@ def main():
             "features": features, "targets": targets,
             "daily": daily_nav, "returns": daily_returns
         }
-        print(f"OK ({len(daily_nav)}d → {len(features)}特征)")
+        # 计算我的实际盈亏
+        pnl, pnl_pct, cost = calc_my_return(fc, daily_nav)
+        all_fund_data[fc]["pnl"] = pnl
+        all_fund_data[fc]["pnl_pct"] = pnl_pct
+        all_fund_data[fc]["cost"] = cost
+        if pnl is not None:
+            print(f"OK ({len(daily_nav)}d → {len(features)}特征, 盈亏{pnl:+.0f}元 {pnl_pct:+.1f}%)")
+        else:
+            print(f"OK ({len(daily_nav)}d → {len(features)}特征)")
 
     # 4. 预测 + 在线校准
     print("\n  预测 & 在线校准...")
@@ -1721,6 +1748,7 @@ def main():
             "history": fd["daily"],
             "final_pred": final, "global_pred": g, "sector_pred": s, "individual_pred": i,
             "accuracy": acc_ens, "accuracy_indiv": acc_indiv, "advice": advice,
+            "pnl": fd.get("pnl"), "pnl_pct": fd.get("pnl_pct"), "cost": fd.get("cost"),
         })
 
         pct = final * 100
