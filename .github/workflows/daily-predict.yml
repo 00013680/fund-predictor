@@ -6,7 +6,9 @@ on:
     - cron: '30 1 * * *'
     # 每天北京时间 11:35 (UTC 3:35) - 中午修正预测
     - cron: '35 3 * * *'
-  workflow_dispatch:  # 允许手动触发
+    # 每天北京时间 15:35 (UTC 7:35) - 收盘学习
+    - cron: '35 7 * * *'
+  workflow_dispatch:
     inputs:
       mode:
         description: '运行模式'
@@ -17,6 +19,7 @@ on:
           - auto
           - morning
           - noon
+          - close
 
 permissions:
   contents: write
@@ -39,6 +42,8 @@ jobs:
           MODE="${{ github.event.inputs.mode }}"
           if [ "$MODE" = "noon" ]; then
             python fund_predictor.py --noon
+          elif [ "$MODE" = "close" ]; then
+            python fund_predictor.py --close
           elif [ "$MODE" = "morning" ]; then
             python fund_predictor.py
           else
@@ -46,6 +51,8 @@ jobs:
             HOUR=$(date -u +%H)
             if [ "$HOUR" = "03" ]; then
               python fund_predictor.py --noon
+            elif [ "$HOUR" = "07" ]; then
+              python fund_predictor.py --close
             else
               python fund_predictor.py
             fi

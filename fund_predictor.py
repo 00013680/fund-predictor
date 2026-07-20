@@ -1365,6 +1365,181 @@ document.addEventListener('DOMContentLoaded', function() {{
     return html
 
 
+# ========== 收盘学习 ==========
+def close_learn():
+    """收盘后：拉实际净值→对比预测→在线学习→输出总结"""
+    now = datetime.now()
+    update_time = now.strftime("%Y-%m-%d %H:%M")
+    print(f"[{update_time}] 基金预测 v6 — 收盘学习")
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    # 1. 拉今日实际净值
+    print("  拉取今日净值...")
+    today_navs = {}
+    for fund in FUNDS:
+        fc = fund["code"]
+        records = fetch_fund_nav_all(fc)
+        if records and len(records) >= 2:
+            today_navs[fc] = records
+            print(f"    {fund['name']}: {records[-1]['nav']:.4f} ({records[-1]['date']})")
+        time.sleep(0.2)
+
+    # 2. 读早上预测
+    morning = load_morning_prediction()
+    if not morning:
+        print("  ⚠️ 今天没有早上预测记录，跳过对比")
+        # 即使没有预测，也可以做学习
+    morning_funds = morning.get("funds", {}) if morning else {}
+
+    # 3. 拉板块和大盘数据（用于特征计算）
+    print("  拉取大盘/板块数据...")
+    market_daily = []
+    for name, code in MARKET_INDICES.items():
+        data = fetch_sina_kline(code, 999)
+        if data:
+            market_daily.append(calc_returns(data, "close"))
+        time.sleep(0.2)
+
+    sector_daily = {}
+    sector_kline = {}
+    for sc, si in SECTORS.items():
+        data = fetch_sina_kline(si["index"], 999)
+        if data:
+            sector_daily[sc] = calc_returns(data, "close")
+            sector_kline[sc] = data
+        time.sleep(0.2)
+
+    # 4. 对比+学习
+    print("\n" + "=" * 60)
+    print("  📊 收盘对比 & 在线学习")
+    print("=" * 60)
+
+    results = []
+    for fund in FUNDS:
+        fc = fund["code"]
+        if fc not in today_navs:
+            continue
+
+        records = today_navs[fc]
+        daily_returns = calc_returns(records, "nav")
+        if len(daily_returns) < 30:
+            continue
+
+        # 计算今日实际收益率
+        today_return = daily_returns[-1]["return"]
+        today_pct = today_return * 100
+        today_date = daily_returns[-1]["date"]
+
+        # 加载模型
+        params = BEST_PARAMS.get(fc, (36, 0.1))
+        alpha = params[1]
+        indiv_path = os.path.join(MODEL_DIR, f"{fc}_indiv.json")
+        model = RidgeModel(alpha=alpha*0.5, lr=0.01, n_epochs=5)
+        last_date = load_model_state(model, indiv_path)
+
+        # 构建今天的特征（用最新一条）
+        sector_vol_by_date = {}
+        if fund["sector"] in sector_kline:
+            for d in sector_kline[fund["sector"]]:
+                sector_vol_by_date[d["date"]] = d["volume"]
+
+        market_vol_by_date = {}
+        market_kline_list = []
+        for name, code in MARKET_INDICES.items():
+            data = fetch_sina_kline(code, 999)
+            if data:
+                market_kline_list.append(data)
+        for mk in market_kline_list:
+            for d in mk:
+                market_vol_by_date[d["date"]] = market_vol_by_date.get(d["date"], 0) + d["volume"]
+        for k in market_vol_by_date:
+            market_vol_by_date[k] /= len(market_kline_list) if market_kline_list else 1
+
+        northbound_by_date = fetch_northbound_flow()
+
+        features, targets = build_features_daily(
+            daily_returns,
+            sector_daily.get(fund["sector"], []),
+            market_daily,
+            sector_vol_by_date=sector_vol_by_date,
+            market_vol_by_date=market_vol_by_date,
+            northbound_by_date=northbound_by_date,
+        )
+
+        if not features or len(features) < 2:
+            continue
+
+        # 用倒数第二条特征预测（对应今天）
+        last_feat = features[-2] if len(features) >= 2 else features[-1]
+        pred = model.predict(last_feat) if model.trained else 0
+        pred_pct = pred * 100
+
+        # 方向是否正确
+        direction_ok = (pred > 0 and today_return > 0) or (pred < 0 and today_return < 0)
+        deviation = today_pct - pred_pct
+
+        # 在线学习：用今天的实际结果更新模型
+        if model.trained and len(features) >= 2:
+            model.partial_fit([features[-2]], [today_return], n_epochs=5)
+            save_model_state(model, indiv_path, today_date)
+            learned = True
+        else:
+            learned = False
+
+        # 我的盈亏
+        pnl, pnl_pct_val, cost = calc_my_return(fc, records)
+
+        icon = "✓" if direction_ok else "✗"
+        learn_icon = "🧠" if learned else "⚪"
+        results.append({
+            "name": fund["name"], "code": fc,
+            "pred_pct": pred_pct, "actual_pct": today_pct,
+            "deviation": deviation, "direction_ok": direction_ok,
+            "learned": learned, "pnl": pnl, "pnl_pct": pnl_pct_val, "cost": cost,
+        })
+
+    # 输出表格
+    print(f"\n  {'基金':<14} {'预测':>7} {'实际':>7} {'偏差':>7} {'方向':>4} {'学习':>4} {'我的盈亏':>12}")
+    print(f"  {'─'*14} {'─'*7} {'─'*7} {'─'*7} {'─'*4} {'─'*4} {'─'*12}")
+
+    for r in results:
+        pnl_str = f"{r['pnl']:+.0f}元" if r['pnl'] is not None else "—"
+        print(f"  {r['name']:<12} {r['pred_pct']:>+6.2f}% {r['actual_pct']:>+6.2f}% "
+              f"{r['deviation']:>+6.2f}% {'✓' if r['direction_ok'] else '✗':>4} "
+              f"{'🧠' if r['learned'] else '—':>4} {pnl_str:>12}")
+
+    # 统计
+    correct = sum(1 for r in results if r["direction_ok"])
+    total = len(results)
+    learned_count = sum(1 for r in results if r["learned"])
+    print(f"\n  方向准确: {correct}/{total} ({correct/total*100:.0f}%)" if total else "  无数据")
+    print(f"  模型已更新: {learned_count}只")
+
+    # 保存收盘记录
+    close_record = {
+        "date": now.strftime("%Y-%m-%d"),
+        "type": "close",
+        "funds": {r["code"]: {
+            "predicted": round(r["pred_pct"], 3),
+            "actual": round(r["actual_pct"], 3),
+            "deviation": round(r["deviation"], 3),
+            "direction_ok": r["direction_ok"],
+            "name": r["name"],
+        } for r in results},
+        "accuracy": round(correct/total*100, 1) if total else 0,
+    }
+    save_daily_prediction(close_record)
+    print("  📝 已保存收盘记录（模型已在线学习更新）")
+
+    # 总结
+    total_pnl = sum(r["pnl"] for r in results if r["pnl"] is not None)
+    total_cost = sum(r["cost"] for r in results if r["cost"] is not None)
+    if total_cost > 0:
+        total_pct = total_pnl / total_cost * 100
+        print(f"\n  💰 总盈亏: {total_pnl:+.0f}元 ({total_pct:+.1f}%) · 总投入{total_cost:.0f}元")
+
+
 # ========== 中午修正预测 ==========
 SCRAPER_DB = os.path.join(SCRIPT_DIR, "market_data.db")
 
@@ -1788,5 +1963,7 @@ def main():
 if __name__ == "__main__":
     if "--noon" in sys.argv:
         noon_predict()
+    elif "--close" in sys.argv:
+        close_learn()
     else:
         main()
