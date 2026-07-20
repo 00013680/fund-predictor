@@ -16,15 +16,20 @@ from urllib.request import urlopen, Request
 
 # ========== 交易记录（用户持仓） ==========
 TRANSACTIONS = [
-    {"code": "021753", "name": "南方电力C", "type": "买入", "amount": 2000, "date": "2026-07-16"},
-    {"code": "014064", "name": "银华农业C", "type": "买入", "amount": 5000, "date": "2026-07-16"},
+    # 买入
     {"code": "017938", "name": "易方达医疗C", "type": "买入", "amount": 2000, "date": "2026-07-15"},
-    {"code": "015468", "name": "嘉实农业C", "type": "转入", "amount": 0, "date": "2026-07-17", "shares": 726.62, "note": "从华商电子C转入"},
-    {"code": "014064", "name": "银华农业C", "type": "转出", "amount": 0, "date": "2026-07-18", "note": "部分转至南方电力C"},
-    {"code": "017938", "name": "易方达医疗C", "type": "转出", "amount": 0, "date": "2026-07-18", "note": "部分转至南方电力C"},
-    {"code": "022831", "name": "华商电子C", "type": "清仓", "amount": 0, "date": "2026-07-18", "note": "全部转至嘉实农业C"},
-    {"code": "012087", "name": "博时健康C", "type": "清仓", "amount": 0, "date": "2026-07-18", "note": "卖出"},
-    {"code": "027034", "name": "中银AI C", "type": "清仓", "amount": 0, "date": "2026-07-18", "note": "卖出"},
+    {"code": "022831", "name": "华商电子C", "type": "买入", "amount": 3000, "date": "2026-07-15"},
+    {"code": "012087", "name": "博时健康C", "type": "买入", "amount": 3000, "date": "2026-07-16"},
+    {"code": "014064", "name": "银华农业C", "type": "买入", "amount": 5000, "date": "2026-07-16"},
+    {"code": "021753", "name": "南方电力C", "type": "买入", "amount": 2000, "date": "2026-07-16"},
+    {"code": "017175", "name": "天弘绿色电力C", "type": "买入", "amount": 1000, "date": "2026-07-20"},
+    # 卖出
+    {"code": "012087", "name": "博时健康C", "type": "卖出", "shares": 4526.25, "date": "2026-07-17"},
+    {"code": "027034", "name": "中银AI C", "type": "卖出", "shares": 2596.95, "date": "2026-07-17"},
+    # 转换
+    {"code": "022831", "name": "华商电子C", "type": "转出", "target": "015468", "target_name": "嘉实农业C", "shares": 726.62, "date": "2026-07-17"},
+    {"code": "017938", "name": "易方达医疗C", "type": "转出", "target": "021753", "target_name": "南方电力C", "shares": 2724.05, "date": "2026-07-17"},
+    {"code": "014064", "name": "银华农业C", "type": "转出", "target": "021753", "target_name": "南方电力C", "shares": 1421.10, "date": "2026-07-17"},
 ]
 
 # ========== 配置 ==========
